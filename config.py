@@ -24,6 +24,10 @@ class Config:
     ffn_dim:      int   = 1024
     dropout:      float = 0.1
 
+    # ── ORION: Temporal Pattern Library ──────────────────────────────────────
+    num_patterns:  int   = 128
+    w_pattern_div: float = 0.01
+
     # ── Path sampling ─────────────────────────────────────────────────────────
     num_paths:    int = 8
     max_path_len: int = 3

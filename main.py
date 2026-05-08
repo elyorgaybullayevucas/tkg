@@ -14,7 +14,7 @@ import torch
 
 from config import Config, DATASET_STATS
 from data.datamodule import TKGDataModule
-from models.elite_tkg_model import CATREModel as EliteTKGModel
+from models.elite_tkg_model import ORIONModel as EliteTKGModel
 from trainers.trainer import EliteTrainer
 from utils.logging import get_logger
 
@@ -181,12 +181,15 @@ def main():
         num_layers          = cfg.num_layers,
         ffn_dim             = cfg.ffn_dim,
         num_negative        = cfg.num_negative,
+        num_patterns        = cfg.num_patterns,
         dropout             = cfg.dropout,
         label_smoothing     = cfg.label_smoothing,
         w_direct            = cfg.w_direct,
+        w_pattern_div       = cfg.w_pattern_div,
         use_direct_scoring  = cfg.use_direct_scoring,
         use_diachronic      = cfg.use_diachronic,
         use_history         = cfg.use_history,
+        max_history         = cfg.max_history,
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

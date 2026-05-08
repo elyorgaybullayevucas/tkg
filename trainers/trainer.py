@@ -62,12 +62,13 @@ class EliteTrainer:
             if m is not None:
                 emb_params += list(m.parameters())
 
-        # Neighborhood + direct + diachronic modullar — o'rta tezlik
+        # Neighborhood + pattern + direct + diachronic — o'rta tezlik
         extra_params: list = []
-        for name in ("msa", "gate_mem", "rel_mem", "nb_ctx", "hist_norm",
+        for name in ("relation_profile", "hist_transformer", "hist_to_entity",
+                     "gate_mem", "nb_ctx", "hist_norm", "pattern_lib",
                      "direct_head", "dia_amp", "dia_freq", "dia_phase",
-                     # v1 backward compat
-                     "pna", "csa", "history_encoder", "hist_gate", "diachronic"):
+                     # backward compat
+                     "msa", "rel_mem", "pna", "csa", "history_encoder", "hist_gate"):
             m = getattr(self._raw, name, None)
             if m is not None:
                 extra_params += list(m.parameters())
