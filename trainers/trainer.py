@@ -38,7 +38,8 @@ class EliteTrainer:
         valid_dataset: TKGEliteDataset,
         test_dataset:  TKGEliteDataset,
     ):
-        self.model   = model
+        self.model   = model   # may be nn.DataParallel
+        self._raw    = model.module if hasattr(model, "module") else model  # raw model
         self.cfg     = cfg
         self.train_loader = train_loader
         self.valid_loader = valid_loader
@@ -49,15 +50,15 @@ class EliteTrainer:
         self.device = torch.device(
             cfg.device if torch.cuda.is_available() else "cpu"
         )
-        self.model.to(self.device)
+        self._raw.to(self.device)
 
         self.logger = get_logger("elite_trainer", cfg.log_dir)
 
         # ── Optimizer ─────────────────────────────────────────────────────────
-        # CATRE: ent_emb + rel_emb + delta_enc — sekin o'qitish
+        # CATRE: ent_emb + rel_emb + delta_enc — sekin o'qitish (_raw dan olinadi)
         emb_params: list = []
         for name in ("ent_emb", "rel_emb", "delta_enc", "embeddings"):
-            m = getattr(model, name, None)
+            m = getattr(self._raw, name, None)
             if m is not None:
                 emb_params += list(m.parameters())
 
@@ -67,7 +68,7 @@ class EliteTrainer:
                      "direct_head", "dia_amp", "dia_freq", "dia_phase",
                      # v1 backward compat
                      "pna", "csa", "history_encoder", "hist_gate", "diachronic"):
-            m = getattr(model, name, None)
+            m = getattr(self._raw, name, None)
             if m is not None:
                 extra_params += list(m.parameters())
 
@@ -75,7 +76,7 @@ class EliteTrainer:
         emb_set   = {id(p) for p in emb_params}
         extra_set = {id(p) for p in extra_params}
         other_params = [
-            p for p in model.parameters()
+            p for p in self._raw.parameters()
             if id(p) not in emb_set and id(p) not in extra_set
         ]
         self.optimizer = AdamW([
@@ -152,12 +153,12 @@ class EliteTrainer:
             if self.use_fp16:
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+                nn.utils.clip_grad_norm_(self._raw.parameters(), self.cfg.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 total_loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+                nn.utils.clip_grad_norm_(self._raw.parameters(), self.cfg.grad_clip)
                 self.optimizer.step()
 
             self.scheduler.step()
@@ -191,7 +192,7 @@ class EliteTrainer:
             hist_mask   = batch["hist_mask"].to(self.device)
 
             with autocast(device_type="cuda", enabled=self.use_fp16):
-                scores = self.model.predict(
+                scores = self._raw.predict(
                     subjects, relations, times, paths, path_masks,
                     history=history, hist_mask=hist_mask,
                 )
@@ -216,7 +217,7 @@ class EliteTrainer:
         path = os.path.join(self.cfg.save_dir, f"{self.cfg.dataset}_{tag}.pt")
         torch.save({
             "epoch":       epoch,
-            "model_state": self.model.state_dict(),
+            "model_state": self._raw.state_dict(),
             "optim_state": self.optimizer.state_dict(),
             "sched_state": self.scheduler.state_dict(),
             "metrics":     metrics,
@@ -226,7 +227,7 @@ class EliteTrainer:
 
     def load(self, path: str) -> int:
         ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state"])
+        self._raw.load_state_dict(ckpt["model_state"])
         self.optimizer.load_state_dict(ckpt["optim_state"])
         self.logger.info(f"Yuklandi: {path} (epoch {ckpt['epoch']})")
         return ckpt["epoch"]

@@ -127,8 +127,10 @@ def main():
         cfg.num_negative       = 256
 
         # Multi-scale neighborhood aggregation (CATRE)
+        # max_history=64: (B,H,E) = (256,64,256) = 4M elems × 2B = 8MB — GPU safe
         cfg.use_history        = True
-        cfg.max_history        = 512
+        cfg.max_history        = 64
+        cfg.batch_size         = 256
 
         # Direct scoring + diachronic
         cfg.use_direct_scoring = True
@@ -189,6 +191,14 @@ def main():
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Parametrlar: {n_params/1e6:.2f}M")
+
+    # ── Multi-GPU (DataParallel) ───────────────────────────────────────────────
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1 and cfg.device == "cuda":
+        model = torch.nn.DataParallel(model)
+        logger.info(f"DataParallel: {n_gpus} ta GPU")
+    else:
+        logger.info(f"Single GPU/CPU")
 
     # ── Trainer ───────────────────────────────────────────────────────────────
     trainer = EliteTrainer(
