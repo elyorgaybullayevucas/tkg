@@ -131,7 +131,7 @@ class QueryAdaptivePNA(nn.Module):
     ) -> torch.Tensor:             # (B, E)
         B, H, E = nb_emb.shape
         eps  = 1e-6
-        fill = -1e4 if nb_emb.dtype == torch.float16 else -1e9
+        fill = -1e4  # fp16 safe
 
         # DistMult messages
         messages = nb_emb * self.rel_proj(nb_rel_emb)              # (B, H, E)
@@ -236,7 +236,7 @@ class CrossSnapshotAttention(nn.Module):
         hist_mask:  torch.Tensor,  # (B, H)
     ) -> torch.Tensor:             # (B, E)
         B, H, E = messages.shape
-        fill = -1e4 if messages.dtype == torch.float16 else -1e9
+        fill = -1e4  # fp16 max ~65504, -1e9 overflow qiladi
 
         # K: message + time encoding
         keys   = self.key_proj(torch.cat([messages, delta_enc], dim=-1))  # (B, H, E)
