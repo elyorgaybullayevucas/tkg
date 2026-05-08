@@ -14,7 +14,7 @@ import torch
 
 from config import Config, DATASET_STATS
 from data.datamodule import TKGDataModule
-from models.elite_tkg_model import STORMModel as EliteTKGModel
+from models.elite_tkg_model import CATREModel as EliteTKGModel
 from trainers.trainer import EliteTrainer
 from utils.logging import get_logger
 
@@ -28,7 +28,7 @@ def seed_everything(seed: int):
 
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser("STORM — TKG Model")
+    p = argparse.ArgumentParser("CATRE — Cross-scale Adaptive Temporal Reasoning for Extrapolation")
 
     p.add_argument("--dataset",  default="ICEWS18",
                    choices=["ICEWS14", "ICEWS18", "WIKI", "YAGO", "YAGOs", "GDELT"])
@@ -122,40 +122,49 @@ def main():
         logger.info("GDELT: num_paths=3, max_path_len=2, batch_size=1024")
 
     if cfg.dataset in ("WIKI", "YAGO", "YAGOs"):
-        cfg.num_paths          = 6
+        cfg.num_paths          = 8
         cfg.max_path_len       = 3
-        cfg.num_negative       = 200
+        cfg.num_negative       = 256
 
-        # Neighborhood aggregation
+        # Multi-scale neighborhood aggregation (CATRE)
         cfg.use_history        = True
-        cfg.max_history        = 300
+        cfg.max_history        = 512
 
         # Direct scoring + diachronic
         cfg.use_direct_scoring = True
         cfg.use_diachronic     = True
         cfg.w_direct           = 2.0
 
-        # Loss
+        # Loss weights
         cfg.w_link             = 1.0
-        cfg.w_self_adv         = 0.3
-        cfg.w_ortho_reg        = 0.01
+        cfg.w_self_adv         = 0.5
+        cfg.w_ortho_reg        = 0.02
 
         # Regularization
-        cfg.dropout            = 0.2
-        cfg.label_smoothing    = 0.15
-        cfg.weight_decay       = 2e-4
+        cfg.dropout            = 0.15
+        cfg.label_smoothing    = 0.1
+        cfg.weight_decay       = 1e-4
 
         # Training
-        cfg.learning_rate      = 1e-3
-        cfg.num_epochs         = 300
+        cfg.learning_rate      = 5e-4
+        cfg.num_epochs         = 500
 
         logger.info(
-            f"{cfg.dataset}: STORM sozlamalari:\n"
+            f"{cfg.dataset}: CATRE sozlamalari:\n"
             f"  use_history=True (max_history={cfg.max_history}), "
             f"DirectScoring=True, Diachronic=True, w_direct={cfg.w_direct},\n"
-            f"  RTE (Relative Δt Encoding), QueryAdaptivePNA+CSA+tawaregate,\n"
+            f"  MultiScaleAggregator (learnable τ₁,τ₂), RelationalMemory (DaeMon-inspired),\n"
+            f"  EntityIndependent paths, ThreeSignalFusion,\n"
             f"  epochs={cfg.num_epochs}, LR={cfg.learning_rate}"
         )
+
+    if cfg.dataset == "ICEWS18":
+        cfg.use_history        = True
+        cfg.max_history        = 64
+        cfg.w_self_adv         = 0.5
+        cfg.w_ortho_reg        = 0.01
+        cfg.num_epochs         = 50
+        logger.info("ICEWS18: CATRE sozlamalari: use_history=True, max_history=64")
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = EliteTKGModel(

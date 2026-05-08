@@ -54,7 +54,7 @@ class EliteTrainer:
         self.logger = get_logger("elite_trainer", cfg.log_dir)
 
         # ── Optimizer ─────────────────────────────────────────────────────────
-        # STORM: ent_emb + rel_emb + delta_enc — sekin o'qitish
+        # CATRE: ent_emb + rel_emb + delta_enc — sekin o'qitish
         emb_params: list = []
         for name in ("ent_emb", "rel_emb", "delta_enc", "embeddings"):
             m = getattr(model, name, None)
@@ -63,10 +63,10 @@ class EliteTrainer:
 
         # Neighborhood + direct + diachronic modullar — o'rta tezlik
         extra_params: list = []
-        for name in ("pna", "csa", "gate_mem", "nb_ctx", "hist_norm",
+        for name in ("msa", "gate_mem", "rel_mem", "nb_ctx", "hist_norm",
                      "direct_head", "dia_amp", "dia_freq", "dia_phase",
-                     # eski model uchun backward compat
-                     "history_encoder", "hist_gate", "diachronic"):
+                     # v1 backward compat
+                     "pna", "csa", "history_encoder", "hist_gate", "diachronic"):
             m = getattr(model, name, None)
             if m is not None:
                 extra_params += list(m.parameters())
