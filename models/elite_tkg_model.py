@@ -155,10 +155,10 @@ class QueryAdaptivePNA(nn.Module):
         mean_v = msgs_v.sum(1) / n_valid                            # (B, E)
         max_v  = msgs_v.max(1).values                               # (B, E)
 
-        msgs_min = messages_dec.masked_fill(~hist_mask.unsqueeze(-1), 1e9)
-        min_v    = msgs_min.min(1).values.clamp(max=1e4)            # (B, E)
+        msgs_min = messages_dec.masked_fill(~hist_mask.unsqueeze(-1), 1e4)
+        min_v    = msgs_min.min(1).values.clamp(-1e4, 1e4)          # (B, E)
 
-        sq_mean = (msgs_v ** 2).sum(1) / n_valid
+        sq_mean = (msgs_v.clamp(-10, 10) ** 2).sum(1) / n_valid
         std_v   = (sq_mean - mean_v ** 2).clamp(min=eps).sqrt()     # (B, E)
 
         attn_v = (attn_w.unsqueeze(-1) * messages_dec).sum(1)       # (B, E)
