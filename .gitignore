@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyTorch
+*.pt
+*.pth
+
+# Logs
+logs/
+
+# Checkpoints
+checkpoints/
+
+# Dataset
+data/
+
+# VSCode
+.vscode/
+
+# Claude
+.claude/
+
+# Env
+.env
+myenv/
