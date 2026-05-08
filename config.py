@@ -44,7 +44,7 @@ class Config:
 
     # ── Loss weights ──────────────────────────────────────────────────────────
     w_link:        float = 1.0
-    w_contrastive: float = 0.0   # STORM da contrastive yo'q
+    w_contrastive: float = 0.01  # ORION: pattern diversity regularization
     w_self_adv:    float = 0.5
     w_direct:      float = 0.0
     w_ortho_reg:   float = 0.0
