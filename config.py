@@ -53,6 +53,7 @@ class Config:
     w_contrastive:  float = 0.5          # contrastive loss
     w_self_adv:     float = 0.5          # self-adversarial negative sampling
     w_direct:       float = 0.0          # DistMult direct scoring (WIKI/YAGO uchun 1.0+)
+    w_ortho_reg:    float = 0.0          # Orthogonal regularization (WIKI/YAGO uchun 0.01)
 
     # ── Direct scoring ────────────────────────────────────────────────────────
     use_direct_scoring: bool = False     # DistMult-style to'g'ridan scoring

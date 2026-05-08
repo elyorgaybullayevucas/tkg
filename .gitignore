@@ -13,8 +13,11 @@ logs/
 # Checkpoints
 checkpoints/
 
-# Dataset
-data/
+# Dataset raw files (katta fayllar, Python kod emas)
+data/*
+!data/__init__.py
+!data/dataset.py
+!data/datamodule.py
 
 # VSCode
 .vscode/

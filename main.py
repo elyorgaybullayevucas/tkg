@@ -154,21 +154,26 @@ def main():
         cfg.queue_size      = 4096
 
         # ── Neighborhood Aggregation (DaeMon-inspired) ────────────────────────
-        # GRU o'rniga DistMult + PNA: dinamik entity embedding
-        # max_history=300: ko'proq qo'shnini ko'radi (GRU bilan 16 kam edi)
         cfg.use_history     = True
         cfg.max_history     = 300
-        cfg.use_reciprocal  = False     # hali ham foydasi yo'q
+        cfg.use_reciprocal  = False
 
         # ── DistMult Direct Scoring + Diachronic ─────────────────────────────
         cfg.use_direct_scoring = True
         cfg.use_diachronic     = True
-        cfg.w_direct           = 2.0   # 1.5→2.0: dinamik embedding bilan kuchliroq
+        cfg.w_direct           = 2.0
+
+        # ── Temporal encoding: sinusoidal only ───────────────────────────────
+        # WIKI: train t=0..210, test t=222..231 — learned[222..231] hech qachon
+        # train da ko'rilmagan (random init). Sinusoidal matematik jihatdan
+        # to'g'ri interpolatsiya qiladi va test vaqtida yaxshi umumlashadi.
+        cfg.use_time_encoding = "sinusoidal"
 
         # ── Loss og'irliklari ─────────────────────────────────────────────────
         cfg.w_link          = 1.0
         cfg.w_contrastive   = 0.1
         cfg.w_self_adv      = 0.3
+        cfg.w_ortho_reg     = 0.01
 
         # ── Regularizatsiya ───────────────────────────────────────────────────
         cfg.dropout         = 0.2
@@ -176,13 +181,14 @@ def main():
         cfg.weight_decay    = 2e-4
 
         # ── O'qitish ──────────────────────────────────────────────────────────
-        cfg.learning_rate   = 1e-3      # tezroq o'rganish
-        cfg.num_epochs      = 300       # ko'proq epoch
+        cfg.learning_rate   = 1e-3
+        cfg.num_epochs      = 300
 
         logger.info(
             f"{cfg.dataset}: sozlamalar:\n"
             f"  NeighborhoodAggregator=True (max_history={cfg.max_history}), "
             f"DirectScoring=True, Diachronic=True, w_direct={cfg.w_direct}, "
+            f"TimeEncoding={cfg.use_time_encoding}, "
             f"epochs={cfg.num_epochs}, LR={cfg.learning_rate}"
         )
 
@@ -209,6 +215,7 @@ def main():
         use_diachronic      = cfg.use_diachronic,
         w_direct            = cfg.w_direct,
         use_history         = cfg.use_history,
+        use_time_encoding   = cfg.use_time_encoding,
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

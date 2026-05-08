@@ -89,23 +89,25 @@ class TemporalEmbedding(nn.Module):
         relation_dim: int,
         time_dim: int,
         dropout: float = 0.1,
+        use_sinusoidal_only: bool = False,
     ):
         super().__init__()
-        self.entity_dim   = entity_dim
-        self.relation_dim = relation_dim
-        self.time_dim     = time_dim
+        self.entity_dim          = entity_dim
+        self.relation_dim        = relation_dim
+        self.time_dim            = time_dim
+        self.use_sinusoidal_only = use_sinusoidal_only
 
         # Entity & Relation embedding
         self.ent_emb = nn.Embedding(num_entities,  entity_dim,   padding_idx=0)
         self.rel_emb = nn.Embedding(num_relations * 2, relation_dim)  # +inverse
 
-        # Time embedding: learned
+        # Time embedding: learned (faqat "both" rejimida ishlatiladi)
         self.time_emb_learned = nn.Embedding(num_times, time_dim)
 
-        # Time embedding: sinusoidal
-        self.time_emb_sin = SinusoidalTimeEncoding(time_dim, max_time=num_times + 10)
+        # Time embedding: sinusoidal (har doim ishlatiladi; katta buffer extrapolatsiya uchun)
+        self.time_emb_sin = SinusoidalTimeEncoding(time_dim, max_time=max(num_times + 50, 500))
 
-        # Learned + Sinusoidal → time_dim
+        # Learned + Sinusoidal → time_dim (faqat "both" rejimida)
         self.time_proj = nn.Sequential(
             nn.Linear(time_dim * 2, time_dim),
             nn.LayerNorm(time_dim),
@@ -128,10 +130,18 @@ class TemporalEmbedding(nn.Module):
         nn.init.xavier_uniform_(self.time_emb_learned.weight)
 
     def get_time_emb(self, t: torch.Tensor) -> torch.Tensor:
-        """t: (...,) → (..., time_dim)"""
-        learned = self.time_emb_learned(t.clamp(0, self.time_emb_learned.num_embeddings - 1))
+        """t: (...,) → (..., time_dim)
+
+        sinusoidal_only rejimida faqat sinusoidal ishlatiladi.
+        Bu WIKI/YAGO uchun muhim: test t=222..231 hech qachon train da ko'rilmagan,
+        shuning uchun learned[222..231] xavier random — sinusoidal esa matematik jihatdan
+        to'g'ri interpolatsiya/ekstrapolatsiya qiladi.
+        """
+        if self.use_sinusoidal_only:
+            return self.time_emb_sin(t)
+        learned    = self.time_emb_learned(t.clamp(0, self.time_emb_learned.num_embeddings - 1))
         sinusoidal = self.time_emb_sin(t)
-        combined = torch.cat([learned, sinusoidal], dim=-1)
+        combined   = torch.cat([learned, sinusoidal], dim=-1)
         return self.time_proj(combined)
 
     def get_entity_emb(self, e: torch.Tensor) -> torch.Tensor:
@@ -715,6 +725,7 @@ class EliteTKGModel(nn.Module):
         use_diachronic:     bool = False,
         w_direct:           float = 0.0,
         use_history:        bool = False,
+        use_time_encoding:  str  = "both",  # "both" | "sinusoidal"
     ):
         super().__init__()
         self.num_entities       = num_entities
@@ -737,6 +748,7 @@ class EliteTKGModel(nn.Module):
             relation_dim=relation_dim,
             time_dim=time_dim,
             dropout=dropout,
+            use_sinusoidal_only=(use_time_encoding == "sinusoidal"),
         )
 
         # ── 2. Query Encoder ──────────────────────────────────────────────────
@@ -1072,10 +1084,19 @@ class EliteTKGModel(nn.Module):
         else:
             self_adv_loss = torch.tensor(0.0, device=device)
 
+        # ── 8. Orthogonal regularization (DaeMon kabi) — WIKI/YAGO uchun ──────
+        # Relation embedding larini ortogonal bo'lishga undaydi:
+        # ||R·Rᵀ - I||₂  → kam relatsiyali dataset larda kuchli regularizator
+        rel_w = self.embeddings.rel_emb.weight  # (R, dim)
+        tmp   = rel_w @ rel_w.t()               # (R, R)
+        I     = torch.eye(tmp.size(0), device=device)
+        ortho_reg = torch.norm(tmp - I, p=2)
+
         losses = {
             "link":        link_loss,
             "contrastive": contrastive_loss,
             "self_adv":    self_adv_loss,
+            "ortho_reg":   ortho_reg,
         }
         return scores, losses
 
