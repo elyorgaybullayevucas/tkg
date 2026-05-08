@@ -114,59 +114,98 @@ def main():
         f"Test:{len(dm.test_ds):,}"
     )
 
-    # ── Dataset-specific sozlamalar ───────────────────────────────────────────
+    # ── Dataset-specific sozlamalar (elif — bir-biriga ta'sir qilmaydi) ─────────
     if cfg.dataset == "GDELT":
-        cfg.num_paths    = 3
-        cfg.max_path_len = 2
-        cfg.batch_size   = 1024
-        logger.info("GDELT: num_paths=3, max_path_len=2, batch_size=1024")
+        cfg.num_paths          = 3
+        cfg.max_path_len       = 2
+        cfg.batch_size         = 512
+        cfg.num_negative       = 256
+        cfg.use_history        = True
+        cfg.max_history        = 32        # (512,32,256) = 4M elems — GPU safe
+        cfg.use_direct_scoring = True
+        cfg.use_diachronic     = True
+        cfg.w_direct           = 1.0
+        cfg.w_link             = 1.0
+        cfg.w_self_adv         = 0.5
+        cfg.w_ortho_reg        = 0.01
+        cfg.dropout            = 0.1
+        cfg.label_smoothing    = 0.1
+        cfg.weight_decay       = 1e-4
+        cfg.learning_rate      = 3e-4
+        cfg.num_epochs         = 30
+        logger.info(
+            "GDELT: num_paths=3, max_path_len=2, batch_size=512, "
+            "use_history=True, max_history=32, DirectScoring=True, Diachronic=True, epochs=30"
+        )
 
-    if cfg.dataset in ("WIKI", "YAGO", "YAGOs"):
+    elif cfg.dataset in ("WIKI", "YAGO", "YAGOs"):
         cfg.num_paths          = 8
         cfg.max_path_len       = 3
+        cfg.batch_size         = 256
         cfg.num_negative       = 256
-
-        # Multi-scale neighborhood aggregation (CATRE)
-        # max_history=64: (B,H,E) = (256,64,256) = 4M elems × 2B = 8MB — GPU safe
         cfg.use_history        = True
         cfg.max_history        = 64
-        cfg.batch_size         = 256
-
-        # Direct scoring + diachronic
         cfg.use_direct_scoring = True
         cfg.use_diachronic     = True
         cfg.w_direct           = 2.0
-
-        # Loss weights
         cfg.w_link             = 1.0
         cfg.w_self_adv         = 0.5
         cfg.w_ortho_reg        = 0.02
-
-        # Regularization
         cfg.dropout            = 0.15
         cfg.label_smoothing    = 0.1
         cfg.weight_decay       = 1e-4
-
-        # Training
         cfg.learning_rate      = 5e-4
         cfg.num_epochs         = 500
-
         logger.info(
-            f"{cfg.dataset}: CATRE sozlamalari:\n"
-            f"  use_history=True (max_history={cfg.max_history}), "
-            f"DirectScoring=True, Diachronic=True, w_direct={cfg.w_direct},\n"
-            f"  MultiScaleAggregator (learnable τ₁,τ₂), RelationalMemory (DaeMon-inspired),\n"
-            f"  EntityIndependent paths, ThreeSignalFusion,\n"
-            f"  epochs={cfg.num_epochs}, LR={cfg.learning_rate}"
+            f"{cfg.dataset}: use_history=True, max_history=64, "
+            f"DirectScoring=True, Diachronic=True, w_direct=2.0, epochs=500, LR=5e-4"
         )
 
-    if cfg.dataset == "ICEWS18":
+    elif cfg.dataset == "ICEWS18":
+        cfg.num_paths          = 8
+        cfg.max_path_len       = 3
+        cfg.batch_size         = 512
+        cfg.num_negative       = 256
         cfg.use_history        = True
         cfg.max_history        = 64
+        cfg.use_direct_scoring = True
+        cfg.use_diachronic     = True
+        cfg.w_direct           = 1.0
+        cfg.w_link             = 1.0
         cfg.w_self_adv         = 0.5
         cfg.w_ortho_reg        = 0.01
+        cfg.dropout            = 0.1
+        cfg.label_smoothing    = 0.1
+        cfg.weight_decay       = 1e-4
+        cfg.learning_rate      = 3e-4
         cfg.num_epochs         = 50
-        logger.info("ICEWS18: CATRE sozlamalari: use_history=True, max_history=64")
+        logger.info(
+            "ICEWS18: use_history=True, max_history=64, "
+            "DirectScoring=True, Diachronic=True, w_direct=1.0, epochs=50"
+        )
+
+    elif cfg.dataset == "ICEWS14":
+        cfg.num_paths          = 8
+        cfg.max_path_len       = 3
+        cfg.batch_size         = 512
+        cfg.num_negative       = 256
+        cfg.use_history        = True
+        cfg.max_history        = 64
+        cfg.use_direct_scoring = True
+        cfg.use_diachronic     = True
+        cfg.w_direct           = 1.0
+        cfg.w_link             = 1.0
+        cfg.w_self_adv         = 0.5
+        cfg.w_ortho_reg        = 0.01
+        cfg.dropout            = 0.1
+        cfg.label_smoothing    = 0.1
+        cfg.weight_decay       = 1e-4
+        cfg.learning_rate      = 3e-4
+        cfg.num_epochs         = 50
+        logger.info(
+            "ICEWS14: use_history=True, max_history=64, "
+            "DirectScoring=True, Diachronic=True, w_direct=1.0, epochs=50"
+        )
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = EliteTKGModel(
