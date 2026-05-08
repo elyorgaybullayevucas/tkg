@@ -54,18 +54,29 @@ class EliteTrainer:
         self.logger = get_logger("elite_trainer", cfg.log_dir)
 
         # ── Optimizer ─────────────────────────────────────────────────────────
-        emb_params = list(model.embeddings.parameters())
+        # STORM: ent_emb + rel_emb + delta_enc — sekin o'qitish
+        emb_params: list = []
+        for name in ("ent_emb", "rel_emb", "delta_enc", "embeddings"):
+            m = getattr(model, name, None)
+            if m is not None:
+                emb_params += list(m.parameters())
 
+        # Neighborhood + direct + diachronic modullar — o'rta tezlik
         extra_params: list = []
-        extra_params += list(model.direct_head.parameters())  if model.direct_head       is not None else []
-        extra_params += list(model.diachronic.parameters())   if model.diachronic         is not None else []
-        extra_params += list(model.history_encoder.parameters()) if model.history_encoder is not None else []
-        extra_params += list(model.hist_gate.parameters())    if model.hist_gate          is not None else []
-        extra_params += list(model.hist_norm.parameters())    if model.hist_norm          is not None else []
+        for name in ("pna", "csa", "gate_mem", "nb_ctx", "hist_norm",
+                     "direct_head", "dia_amp", "dia_freq", "dia_phase",
+                     # eski model uchun backward compat
+                     "history_encoder", "hist_gate", "diachronic"):
+            m = getattr(model, name, None)
+            if m is not None:
+                extra_params += list(m.parameters())
 
+        # Qolgan barcha parametrlar — to'liq tezlik
+        emb_set   = {id(p) for p in emb_params}
+        extra_set = {id(p) for p in extra_params}
         other_params = [
             p for p in model.parameters()
-            if not any(p is ep for ep in emb_params + extra_params)
+            if id(p) not in emb_set and id(p) not in extra_set
         ]
         self.optimizer = AdamW([
             {"params": emb_params,    "lr": cfg.learning_rate * 0.1},
@@ -109,7 +120,7 @@ class EliteTrainer:
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
         totals: Dict[str, float] = {
-            "loss": 0, "link": 0, "contrastive": 0, "self_adv": 0
+            "loss": 0, "link": 0, "contrastive": 0, "self_adv": 0, "ortho": 0
         }
         n = 0
 
@@ -134,6 +145,7 @@ class EliteTrainer:
                     self.cfg.w_link        * losses["link"]
                     + self.cfg.w_contrastive * losses["contrastive"]
                     + self.cfg.w_self_adv    * losses["self_adv"]
+                    + self.cfg.w_ortho_reg   * losses["ortho_reg"]
                 )
 
             self.optimizer.zero_grad()
@@ -154,6 +166,7 @@ class EliteTrainer:
             totals["link"]        += losses["link"].item()
             totals["contrastive"] += losses["contrastive"].item()
             totals["self_adv"]    += losses["self_adv"].item()
+            totals["ortho"]       += losses["ortho_reg"].item()
             n += 1
 
         # Oxirgi (eng katta LR) param group ni log qilamiz
@@ -240,6 +253,7 @@ class EliteTrainer:
                 f"Link:{tr['link']:.4f} | "
                 f"CL:{tr['contrastive']:.4f} | "
                 f"Adv:{tr['self_adv']:.4f} | "
+                f"Ortho:{tr['ortho']:.3f} | "
                 f"LR:{tr['lr']:.2e}"
             )
 

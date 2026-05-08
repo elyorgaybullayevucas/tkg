@@ -1,44 +1,43 @@
 # models/elite_tkg_model.py
 """
-EliteTKGModel — Temporal Knowledge Graph Completion uchun mukammal model.
+STORM: Sequential Temporal Oracle with Relational Memory
 
-Arxitektura:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. TEMPORAL EMBEDDING MODULE
-   - Entity / Relation embedding (Xavier init)
-   - Vaqt embedding: Learned + Sinusoidal (har ikkalasi)
-   - Time-aware entity representation: ent + time_transform(time)
+═══════════════════════════════════════════════════════════════════════════════
+Scientific Contributions
+═══════════════════════════════════════════════════════════════════════════════
 
-2. QUERY ENCODER
-   - (s, r, t) → MLP → query vector q
+1. RELATIVE TEMPORAL ENCODING (RTE)
+   - Muammo: mavjud modellar mutlaq vaqt indeksini ishlatadi → WIKI test
+     t=222..231 train da ko'rilmagan, learned[222..231] random init = shovqin
+   - Yechim: Δt = t_query − t_history, log-scaled sinusoidal encoding
+   - Natija: har qanday kelajak vaqtni to'g'ri ifodalaydi; differensiable
 
-3. PATH ENCODER (Transformer)
-   - Har bir path: [(o1,r1,t1), (o2,r2,t2), ...] ketma-ketligi
-   - Positional + temporal encoding
-   - Multi-head self-attention
-   - Path-level agregatsiya: CLS token
+2. CROSS-SNAPSHOT ATTENTION (CSA)
+   - Muammo: DaeMon RNN-like ketma-ket ishlaydi → uzoq tarix siqiladi,
+     gradient yo'qoladi, erta snapshot lar unutiladi
+   - Yechim: barcha snapshot larni Transformer bilan attend qilish;
+     time-bias: Δt ga qarab vaqt og'irligi
+   - Natija: uzoq masofadagi temporal bog'liqliklarni ushlaydi
 
-4. CONTRASTIVE HEAD (MoCo v2 style)
-   - Online encoder: q → query_proj → normalize
-   - Momentum encoder: entity emb → key_proj → normalize
-   - Negative Queue (8192 ta saqlangan key)
-   - InfoNCE loss, temperature=0.3
+3. QUERY-ADAPTIVE PNA AGGREGATION
+   - Muammo: DaeMon PNA og'irliklari har qanday query uchun bir xil
+   - Yechim: aggregatsiya diqqat og'irliklari = f(relation_query, message)
+   - Natija: har so'rov uchun eng mos qo'shnilarga e'tibor qaratadi
 
-5. LINK PREDICTION HEAD
-   - q → score_mlp → entity_dim space
-   - ConvE-style interaction: reshape → conv → flatten → score
-   - Dot-product + bilinear bilan yakuniy balllar
+4. DUAL-PATH TEMPORAL REASONING
+   - Yo'l A: Multi-hop path reasoning (Transformer encoder)
+   - Yo'l B: Temporal neighborhood aggregation (PNA + CSA + tawaregate)
+   - Birlashtirish: cross-attention → ikki yo'l adaptiv birlashadi
+   - Natija: lokal (1-hop tarix) va struktural (ko'p-hop) naqshlarni ushlaydi
 
-6. SELF-ADVERSARIAL NEGATIVE SAMPLING
-   - Negative lossni negative ballarga qarab og'irlashtirish
-   - Murakkab negativlarga ko'proq e'tibor
+5. TAWAREGATE MEMORY (DaeMon dan olingan, kengaytirilgan)
+   - gate = σ(W_g · [e_static, e_dynamic])
+   - output = gate ⊙ e_dynamic + (1−gate) ⊙ e_static
+   - Kengaytirish: Δt decay bilan og'irlantirilgan
 
-7. LOSS KOMBINATSIYASI
-   - L_total = w1*L_link + w2*L_contrastive + w3*L_self_adv
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+═══════════════════════════════════════════════════════════════════════════════
 """
 import math
-import copy
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -47,241 +46,459 @@ import torch.nn.functional as F
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 1. TEMPORAL EMBEDDING
+# 1. RELATIVE TEMPORAL ENCODING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class SinusoidalTimeEncoding(nn.Module):
+class RelativeTemporalEncoding(nn.Module):
     """
-    Vaqtni sinusoidal encoding bilan ifodalaydi (Transformer positional encoding uslubi).
-    t → [sin(t/10000^(2i/d)), cos(t/10000^(2i/d))]
+    Δt = t_query − t_history ni log-scaled sinusoidal bilan kodlaydi.
+
+    Mutlaq vaqt indeksidan farqi:
+    - Ko'rilmagan kelajak vaqtlar uchun ishlaydi (out-of-vocabulary yo'q)
+    - Silliq va differensiable
+    - Qisqa va uzoq vaqt masofalarini bir xil yaxshi ifodalaydi
+
+    Encoding: sin/cos(log(1+Δt) × freq_i),  log-spaced frequencies
     """
-    def __init__(self, dim: int, max_time: int = 10000):
+    def __init__(self, dim: int, max_delta: int = 20000):
         super().__init__()
         self.dim = dim
-        pe = torch.zeros(max_time, dim)
-        position = torch.arange(0, max_time, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim)
+        freqs = torch.exp(
+            torch.arange(0, dim, 2).float() * (-math.log(max_delta) / dim)
         )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term[:dim // 2])
-        self.register_buffer("pe", pe)  # (max_time, dim)
+        self.register_buffer("freqs", freqs)  # (dim/2,)
 
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        # t: (...,) integer time indices
-        t_clamped = t.clamp(0, self.pe.size(0) - 1)
-        return self.pe[t_clamped]  # (..., dim)
+    def forward(self, delta_t: torch.Tensor) -> torch.Tensor:
+        """delta_t: (...,) int → (..., dim)"""
+        x   = torch.log1p(delta_t.float().clamp(min=0))  # (...,)
+        x   = x.unsqueeze(-1) * self.freqs               # (..., dim/2)
+        enc = torch.cat([torch.sin(x), torch.cos(x)], dim=-1)  # (..., dim)
+        return enc
 
 
-class TemporalEmbedding(nn.Module):
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. QUERY-ADAPTIVE PNA AGGREGATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class QueryAdaptivePNA(nn.Module):
     """
-    Entity, Relation, Time uchun yagona embedding moduli.
+    Query-adaptive Principal Neighbourhood Aggregation.
 
-    Time = Learned embedding + Sinusoidal encoding (concat → project)
-    Entity_t = Entity_emb + time_gate(time_emb)  (gated addition)
+    DaeMon PathAggNet dan farqlari:
+    - Aggregatsiya diqqat og'irliklari query ga bog'liq
+    - Δt asosida vaqt-decay og'irlash
+    - PNA: [mean, max, min, std] × 3 degree scale = 12 aggregator + attn + subject = 14×E
+    - Yangi: min va std aggregatorlari (DaeMon da yo'q)
     """
     def __init__(
         self,
-        num_entities: int,
-        num_relations: int,
-        num_times: int,
-        entity_dim: int,
+        entity_dim:   int,
         relation_dim: int,
-        time_dim: int,
-        dropout: float = 0.1,
-        use_sinusoidal_only: bool = False,
+        delta_dim:    int,
+        dropout:      float = 0.1,
     ):
         super().__init__()
-        self.entity_dim          = entity_dim
-        self.relation_dim        = relation_dim
-        self.time_dim            = time_dim
-        self.use_sinusoidal_only = use_sinusoidal_only
+        self.entity_dim = entity_dim
 
-        # Entity & Relation embedding
-        self.ent_emb = nn.Embedding(num_entities,  entity_dim,   padding_idx=0)
-        self.rel_emb = nn.Embedding(num_relations * 2, relation_dim)  # +inverse
+        # DistMult: relation projection
+        self.rel_proj  = nn.Linear(relation_dim, entity_dim, bias=False)
 
-        # Time embedding: learned (faqat "both" rejimida ishlatiladi)
-        self.time_emb_learned = nn.Embedding(num_times, time_dim)
+        # Query-adaptive attention
+        self.attn_proj = nn.Linear(entity_dim, entity_dim, bias=False)
 
-        # Time embedding: sinusoidal (har doim ishlatiladi; katta buffer extrapolatsiya uchun)
-        self.time_emb_sin = SinusoidalTimeEncoding(time_dim, max_time=max(num_times + 50, 500))
+        # Time-decay: learnable
+        self.log_gamma = nn.Parameter(torch.tensor(-2.0))
 
-        # Learned + Sinusoidal → time_dim (faqat "both" rejimida)
-        self.time_proj = nn.Sequential(
-            nn.Linear(time_dim * 2, time_dim),
-            nn.LayerNorm(time_dim),
+        # PNA: 14 × entity_dim
+        self.pna_proj = nn.Sequential(
+            nn.Linear(entity_dim * 14, entity_dim * 2),
+            nn.LayerNorm(entity_dim * 2),
             nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(entity_dim * 2, entity_dim),
+            nn.LayerNorm(entity_dim),
         )
-
-        # Temporal transformation: entity + time → entity (gating)
-        self.time_gate = nn.Sequential(
-            nn.Linear(entity_dim + time_dim, entity_dim),
-            nn.Sigmoid(),
-        )
-        self.time_transform = nn.Linear(time_dim, entity_dim)
-
-        # Dropout
         self.dropout = nn.Dropout(dropout)
 
-        # Init
-        nn.init.xavier_uniform_(self.ent_emb.weight)
-        nn.init.xavier_uniform_(self.rel_emb.weight)
-        nn.init.xavier_uniform_(self.time_emb_learned.weight)
+    def forward(
+        self,
+        e_emb:      torch.Tensor,  # (B, E)
+        nb_emb:     torch.Tensor,  # (B, H, E)
+        nb_rel_emb: torch.Tensor,  # (B, H, R)
+        delta_t:    torch.Tensor,  # (B, H) int
+        query_emb:  torch.Tensor,  # (B, R)
+        hist_mask:  torch.Tensor,  # (B, H)
+    ) -> torch.Tensor:             # (B, E)
+        B, H, E = nb_emb.shape
+        eps  = 1e-6
+        fill = -1e4 if nb_emb.dtype == torch.float16 else -1e9
 
-    def get_time_emb(self, t: torch.Tensor) -> torch.Tensor:
-        """t: (...,) → (..., time_dim)
+        # DistMult messages
+        messages = nb_emb * self.rel_proj(nb_rel_emb)              # (B, H, E)
 
-        sinusoidal_only rejimida faqat sinusoidal ishlatiladi.
-        Bu WIKI/YAGO uchun muhim: test t=222..231 hech qachon train da ko'rilmagan,
-        shuning uchun learned[222..231] xavier random — sinusoidal esa matematik jihatdan
-        to'g'ri interpolatsiya/ekstrapolatsiya qiladi.
-        """
-        if self.use_sinusoidal_only:
-            return self.time_emb_sin(t)
-        learned    = self.time_emb_learned(t.clamp(0, self.time_emb_learned.num_embeddings - 1))
-        sinusoidal = self.time_emb_sin(t)
-        combined   = torch.cat([learned, sinusoidal], dim=-1)
-        return self.time_proj(combined)
+        # Time-decay
+        gamma        = torch.exp(self.log_gamma)
+        decay        = torch.exp(-gamma * delta_t.float().clamp(min=0))  # (B, H)
+        messages_dec = messages * decay.unsqueeze(-1)               # (B, H, E)
 
-    def get_entity_emb(self, e: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.ent_emb(e))
+        # Query-adaptive attention
+        q_key      = self.attn_proj(query_emb)                      # (B, E)
+        attn_raw   = (messages_dec * q_key.unsqueeze(1)).sum(-1) / math.sqrt(E)  # (B, H)
+        attn_raw   = attn_raw.masked_fill(~hist_mask, fill)
+        attn_w     = torch.softmax(attn_raw, dim=-1)                # (B, H)
 
-    def get_relation_emb(self, r: torch.Tensor) -> torch.Tensor:
-        r_safe = r.clamp(0, self.rel_emb.num_embeddings - 1)
-        return self.dropout(self.rel_emb(r_safe))
+        # Masked aggregators
+        valid_f = hist_mask.float().unsqueeze(-1)                   # (B, H, 1)
+        n_valid = hist_mask.float().sum(1, keepdim=True).clamp(min=1)
+        msgs_v  = messages_dec * valid_f                            # (B, H, E)
 
-    def get_temporal_entity_emb(self, e: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        Vaqtga bog'liq entity representation.
-        e_t = e + sigmoid(W[e; t]) * tanh(W_t * t)
-        """
-        e_emb = self.ent_emb(e)             # (..., E)
-        t_emb = self.get_time_emb(t)        # (..., T)
+        mean_v = msgs_v.sum(1) / n_valid                            # (B, E)
+        max_v  = msgs_v.max(1).values                               # (B, E)
 
-        gate = self.time_gate(
-            torch.cat([e_emb, t_emb], dim=-1)
-        )                                    # (..., E) sigmoid
-        transform = torch.tanh(
-            self.time_transform(t_emb)
-        )                                    # (..., E)
+        msgs_min = messages_dec.masked_fill(~hist_mask.unsqueeze(-1), 1e9)
+        min_v    = msgs_min.min(1).values.clamp(max=1e4)            # (B, E)
 
-        return self.dropout(e_emb + gate * transform)  # (..., E)
+        sq_mean = (msgs_v ** 2).sum(1) / n_valid
+        std_v   = (sq_mean - mean_v ** 2).clamp(min=eps).sqrt()     # (B, E)
+
+        attn_v = (attn_w.unsqueeze(-1) * messages_dec).sum(1)       # (B, E)
+
+        # Degree scaling (log-scale based on n_valid)
+        deg    = n_valid.squeeze(1)                                  # (B,)
+        log_d  = torch.log(deg.clamp(min=1)).unsqueeze(-1)          # (B, 1)
+        mean_d = log_d.mean().clamp(min=1)
+        s1 = torch.ones_like(mean_v)
+        sd = (log_d / mean_d).expand_as(mean_v)
+        si = (mean_d / log_d.clamp(min=0.01)).expand_as(mean_v)
+
+        feats = torch.cat([
+            mean_v * s1, mean_v * sd, mean_v * si,
+            max_v  * s1, max_v  * sd, max_v  * si,
+            min_v  * s1, min_v  * sd, min_v  * si,
+            std_v  * s1, std_v  * sd, std_v  * si,
+            attn_v,
+            e_emb,
+        ], dim=-1)  # (B, 14E)
+
+        return self.pna_proj(feats)  # (B, E)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2. PATH ENCODER — Transformer
+# 3. CROSS-SNAPSHOT ATTENTION (CSA) — yangi ilmiy hissa
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CrossSnapshotAttention(nn.Module):
+    """
+    Transformer-style diqqat temporal tarix bo'ylab.
+
+    DaeMon dan farqi:
+    - DaeMon: ketma-ket RNN-like → erta tarix siqiladi
+    - CSA: barcha tarixiy faktlarni bir vaqtda attend qiladi
+    - Time-bias: Δt ni K larga qo'shish → vaqtga sezgir diqqat
+    - Gradient yo'qolish muammosi yo'q (direct attention)
+
+    Query:  (relation, entity_static) — nima qidirilmoqda
+    Keys:   messages + Δt encoding — tarixiy faktlar
+    Values: neighbor embeddings
+    """
+    def __init__(
+        self,
+        entity_dim:   int,
+        relation_dim: int,
+        delta_dim:    int,
+        num_heads:    int   = 4,
+        dropout:      float = 0.1,
+    ):
+        super().__init__()
+        assert entity_dim % num_heads == 0
+        self.entity_dim = entity_dim
+        self.num_heads  = num_heads
+        self.head_dim   = entity_dim // num_heads
+        self.scale      = math.sqrt(self.head_dim)
+
+        self.key_proj   = nn.Linear(entity_dim + delta_dim, entity_dim)
+        self.val_proj   = nn.Linear(entity_dim, entity_dim)
+        self.query_proj = nn.Linear(relation_dim + entity_dim, entity_dim)
+        self.out_proj   = nn.Sequential(
+            nn.Linear(entity_dim, entity_dim),
+            nn.LayerNorm(entity_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        messages:   torch.Tensor,  # (B, H, E)
+        nb_emb:     torch.Tensor,  # (B, H, E)
+        delta_enc:  torch.Tensor,  # (B, H, D)
+        query_emb:  torch.Tensor,  # (B, R)
+        e_static:   torch.Tensor,  # (B, E)
+        hist_mask:  torch.Tensor,  # (B, H)
+    ) -> torch.Tensor:             # (B, E)
+        B, H, E = messages.shape
+        fill = -1e4 if messages.dtype == torch.float16 else -1e9
+
+        # K: message + time encoding
+        keys   = self.key_proj(torch.cat([messages, delta_enc], dim=-1))  # (B, H, E)
+        values = self.val_proj(nb_emb)                                     # (B, H, E)
+
+        # Q: relation + static entity
+        query  = self.query_proj(
+            torch.cat([query_emb, e_static], dim=-1)
+        ).unsqueeze(1)  # (B, 1, E)
+
+        def split_heads(x):  # (B, S, E) → (B, nh, S, hd)
+            return x.view(x.size(0), x.size(1), self.num_heads, self.head_dim).transpose(1, 2)
+
+        Q = split_heads(query)   # (B, nh, 1, hd)
+        K = split_heads(keys)    # (B, nh, H, hd)
+        V = split_heads(values)  # (B, nh, H, hd)
+
+        attn = (Q @ K.transpose(-2, -1)) / self.scale       # (B, nh, 1, H)
+        mask = ~hist_mask.unsqueeze(1).unsqueeze(2)          # (B, 1, 1, H)
+        attn = attn.masked_fill(mask, fill)
+
+        # Check all-masked → avoid nan
+        all_masked = (~hist_mask).all(dim=1, keepdim=True)   # (B, 1)
+        if all_masked.any():
+            attn = attn.masked_fill(
+                all_masked.unsqueeze(1).unsqueeze(2).expand_as(attn), 0.0
+            )
+
+        attn = torch.softmax(attn, dim=-1)                   # (B, nh, 1, H)
+        out  = (attn @ V).squeeze(2)                         # (B, nh, hd)
+        out  = out.transpose(1, 2).contiguous().view(B, E)   # (B, E)
+
+        return self.out_proj(out)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. GATED TEMPORAL MEMORY (tawaregate — DaeMon dan kengaytirilgan)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class GatedTemporalMemory(nn.Module):
+    """
+    DaeMon tawaregate mexanizmi (kengaytirilgan).
+
+        gate   = σ(W_g · [e_static, e_dynamic])
+        output = gate ⊙ tanh(W_h · e_dynamic) + (1−gate) ⊙ e_static
+
+    Kengaytirish: LayerNorm + residual = barqarorroq gradient
+    """
+    def __init__(self, entity_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.gate      = nn.Sequential(
+            nn.Linear(entity_dim * 2, entity_dim),
+            nn.Sigmoid(),
+        )
+        self.transform = nn.Sequential(
+            nn.Linear(entity_dim, entity_dim),
+            nn.Tanh(),
+        )
+        self.norm    = nn.LayerNorm(entity_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, e_static: torch.Tensor, e_dynamic: torch.Tensor) -> torch.Tensor:
+        gate   = self.gate(torch.cat([e_static, e_dynamic], dim=-1))
+        out    = gate * self.transform(e_dynamic) + (1 - gate) * e_static
+        return self.norm(self.dropout(out))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. PATH ENCODER — Multi-hop Transformer
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class PathTransformerEncoder(nn.Module):
     """
-    Multi-hop path ni Transformer bilan kodlaydi.
-
-    Input:  [(o1,r1,t1), (o2,r2,t2), ...] ketma-ketligi
-    Output: path representation vektori
-
-    CLS token → path ning umumiy ma'nosi
+    Multi-hop temporal yo'lni Transformer bilan kodlaydi.
+    Har bir qadam: [entity, relation, Δt_encoding] → step_vec
+    CLS token → yo'lning umumiy vektori
     """
     def __init__(
         self,
-        entity_dim: int,
+        entity_dim:   int,
         relation_dim: int,
-        time_dim: int,
-        hidden_dim: int,
-        num_heads: int = 8,
-        num_layers: int = 2,
-        ffn_dim: int = 1024,
-        dropout: float = 0.1,
-        max_seq_len: int = 16,
+        delta_dim:    int,
+        hidden_dim:   int,
+        num_heads:    int   = 8,
+        num_layers:   int   = 2,
+        ffn_dim:      int   = 1024,
+        dropout:      float = 0.1,
+        max_seq_len:  int   = 16,
     ):
         super().__init__()
-        self.hidden_dim = hidden_dim
-
-        # Step input: [entity, relation, time] concat → hidden_dim
-        step_dim = entity_dim + relation_dim + time_dim
+        step_dim = entity_dim + relation_dim + delta_dim
         self.step_proj = nn.Sequential(
             nn.Linear(step_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
         )
-
-        # CLS token
         self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+        self.pos_emb   = nn.Embedding(max_seq_len + 1, hidden_dim)
 
-        # Positional encoding
-        self.pos_emb = nn.Embedding(max_seq_len + 1, hidden_dim)
-
-        # Transformer encoder
         enc_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=ffn_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,        # Pre-LN: barqarorroq
+            d_model=hidden_dim, nhead=num_heads,
+            dim_feedforward=ffn_dim, dropout=dropout,
+            activation="gelu", batch_first=True, norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(
-            enc_layer,
-            num_layers=num_layers,
-            enable_nested_tensor=False,  # FutureWarning ni bartaraf etish
+            enc_layer, num_layers=num_layers, enable_nested_tensor=False,
         )
         self.norm = nn.LayerNorm(hidden_dim)
 
+    def forward(self, step_vecs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        BP, L, _ = step_vecs.shape
+        x   = self.step_proj(step_vecs)
+        cls = self.cls_token.expand(BP, -1, -1)
+        x   = torch.cat([cls, x], dim=1)
+        pos = torch.arange(L + 1, device=x.device)
+        x   = x + self.pos_emb(pos).unsqueeze(0)
+
+        cls_m  = torch.ones(BP, 1, dtype=torch.bool, device=x.device)
+        full_m = torch.cat([cls_m, mask], dim=1)
+        out    = self.transformer(x, src_key_padding_mask=~full_m)
+        return self.norm(out)[:, 0, :]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. LINK PREDICTION HEAD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LinkPredHead(nn.Module):
+    def __init__(self, hidden_dim: int, entity_dim: int, num_entities: int, dropout: float = 0.1):
+        super().__init__()
+        self.fc1     = nn.Linear(hidden_dim, hidden_dim)
+        self.fc2     = nn.Linear(hidden_dim, entity_dim)
+        self.norm1   = nn.LayerNorm(hidden_dim)
+        self.norm2   = nn.LayerNorm(entity_dim)
+        self.gate    = nn.Linear(hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.bias    = nn.Parameter(torch.zeros(num_entities))
+
+    def forward(self, q: torch.Tensor, ent_emb: torch.Tensor) -> torch.Tensor:
+        h      = self.norm1(q)
+        g      = torch.sigmoid(self.gate(h))
+        h      = g * F.gelu(self.fc1(h)) + (1 - g) * h
+        h      = self.norm2(self.fc2(self.dropout(h)))
+        scores = h @ ent_emb.t()
+        if scores.size(1) == self.bias.size(0):
+            scores = scores + self.bias
+        return scores
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. DIRECT SCORING HEAD (DistMult-style)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DirectScoringHead(nn.Module):
+    def __init__(self, entity_dim: int, relation_dim: int, num_entities: int, dropout: float = 0.1):
+        super().__init__()
+        self.rel_proj = nn.Linear(relation_dim, entity_dim, bias=False)
+        self.sub_proj = nn.Sequential(
+            nn.Linear(entity_dim, entity_dim),
+            nn.LayerNorm(entity_dim),
+            nn.GELU(),
+        )
+        self.dropout  = nn.Dropout(dropout)
+        self.bias     = nn.Parameter(torch.zeros(num_entities))
+
     def forward(
         self,
-        step_vecs: torch.Tensor,   # (BP, L, step_dim)
-        mask: torch.Tensor,        # (BP, L) True=valid
-    ) -> torch.Tensor:             # (BP, hidden_dim)
-        BP, L, _ = step_vecs.shape
-
-        # Step projection
-        x = self.step_proj(step_vecs)       # (BP, L, H)
-
-        # CLS token prepend
-        cls = self.cls_token.expand(BP, -1, -1)  # (BP, 1, H)
-        x = torch.cat([cls, x], dim=1)            # (BP, L+1, H)
-
-        # Positional encoding
-        positions = torch.arange(L + 1, device=x.device)
-        x = x + self.pos_emb(positions).unsqueeze(0)  # (BP, L+1, H)
-
-        # Attention mask: CLS har doim valid
-        cls_mask = torch.ones(BP, 1, dtype=torch.bool, device=x.device)
-        full_mask = torch.cat([cls_mask, mask], dim=1)  # (BP, L+1)
-        attn_mask = ~full_mask  # True = IGNORE (PyTorch convention)
-
-        # Transformer
-        out = self.transformer(x, src_key_padding_mask=attn_mask)  # (BP, L+1, H)
-        out = self.norm(out)
-
-        # CLS token output = path representation
-        return out[:, 0, :]  # (BP, H)
+        s_emb:       torch.Tensor,  # (B, E)
+        r_emb:       torch.Tensor,  # (B, R)
+        all_ent_emb: torch.Tensor,  # (E_count, E)
+    ) -> torch.Tensor:
+        scores = self.dropout(self.sub_proj(s_emb) * self.rel_proj(r_emb)) @ all_ent_emb.t()
+        if scores.size(1) == self.bias.size(0):
+            scores = scores + self.bias
+        return scores
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. QUERY ENCODER
+# 8. STORM — ASOSIY MODEL
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class QueryEncoder(nn.Module):
+class STORMModel(nn.Module):
     """
-    (s, r, t) → query vector
+    STORM: Sequential Temporal Oracle with Relational Memory
 
-    Subject + Relation + Time concat → Deep MLP → q
+    ┌──────────────────────────────────────────────────────────────┐
+    │  Kirish: (s, r, t_q, paths, history)                        │
+    │                                                              │
+    │  ① Entity / Relation Embeddings (learned, static)           │
+    │  ② Relative Δt Encoding — log-sinusoidal (YANGI)            │
+    │                                                              │
+    │  ③ Parallel Dual-Path:                                      │
+    │    A) Structural Path Reasoning (Transformer, multi-hop)    │
+    │    B) Temporal Neighborhood Aggregation:                    │
+    │       B1. Query-Adaptive PNA (YANGI — 14×E aggregation)     │
+    │       B2. Cross-Snapshot Attention (YANGI — Transformer)    │
+    │       B3. Tawaregate Memory (DaeMon → kengaytirilgan)       │
+    │                                                              │
+    │  ④ Cross-Path Fusion (cross-attention A ↔ B)                │
+    │                                                              │
+    │  ⑤ Dual Scoring:                                            │
+    │    - Path: link_head(fused_q) · all_ent                     │
+    │    - Direct: DistMult(s_dynamic, r) · all_ent               │
+    │                                                              │
+    │  ⑥ Loss: CE + self-adversarial + orthogonal_reg             │
+    └──────────────────────────────────────────────────────────────┘
     """
+
     def __init__(
         self,
-        entity_dim: int,
-        relation_dim: int,
-        time_dim: int,
-        hidden_dim: int,
-        dropout: float = 0.1,
+        num_entities:    int,
+        num_relations:   int,
+        num_times:       int,
+        entity_dim:      int   = 256,
+        relation_dim:    int   = 256,
+        delta_dim:       int   = 64,
+        hidden_dim:      int   = 512,
+        num_heads:       int   = 8,
+        num_layers:      int   = 2,
+        ffn_dim:         int   = 1024,
+        num_negative:    int   = 256,
+        dropout:         float = 0.1,
+        label_smoothing: float = 0.1,
+        w_direct:        float = 0.0,
+        use_history:     bool  = False,
+        use_diachronic:  bool  = False,
+        # backward-compat ignored params
+        time_dim:        int   = 64,
+        proj_dim:        int   = 256,
+        temperature:     float = 0.3,
+        momentum:        float = 0.995,
+        queue_size:      int   = 8192,
+        use_direct_scoring: bool = False,
+        use_time_encoding:  str  = "both",
+        **kwargs,
     ):
         super().__init__()
-        inp_dim = entity_dim + relation_dim + time_dim
-        self.encoder = nn.Sequential(
-            nn.Linear(inp_dim, hidden_dim * 2),
+        self.num_entities    = num_entities
+        self.entity_dim      = entity_dim
+        self.hidden_dim      = hidden_dim
+        self.num_negative    = num_negative
+        self.label_smoothing = label_smoothing
+        self.w_direct        = w_direct if use_direct_scoring else w_direct
+        self.use_history     = use_history
+        self.use_diachronic  = use_diachronic
+
+        # ── Embeddings ────────────────────────────────────────────────────────
+        self.ent_emb = nn.Embedding(num_entities,      entity_dim,   padding_idx=0)
+        self.rel_emb = nn.Embedding(num_relations * 2, relation_dim)
+        nn.init.xavier_uniform_(self.ent_emb.weight)
+        nn.init.xavier_uniform_(self.rel_emb.weight)
+
+        # ── Relative Temporal Encoding ────────────────────────────────────────
+        self.delta_enc = RelativeTemporalEncoding(
+            delta_dim, max_delta=max(num_times * 3, 20000)
+        )
+
+        # ── Query Encoder ─────────────────────────────────────────────────────
+        inp = entity_dim + relation_dim + delta_dim
+        self.query_encoder = nn.Sequential(
+            nn.Linear(inp, hidden_dim * 2),
             nn.LayerNorm(hidden_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -292,498 +509,36 @@ class QueryEncoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-    def forward(
-        self,
-        s_emb: torch.Tensor,    # (B, E)
-        r_emb: torch.Tensor,    # (B, R)
-        t_emb: torch.Tensor,    # (B, T)
-    ) -> torch.Tensor:          # (B, H)
-        x = torch.cat([s_emb, r_emb, t_emb], dim=-1)
-        return self.encoder(x)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4. LINK PREDICTION HEAD — ConvE uslubi
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class LinkPredHead(nn.Module):
-    """
-    q → score barcha entitylar bilan.
-
-    ConvE-inspired: reshape + conv + fc → entity_dim → dot-product
-    """
-    def __init__(
-        self,
-        hidden_dim: int,
-        entity_dim: int,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        # Simple but effective: highway connection bilan
-        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, entity_dim)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(entity_dim)
-        self.dropout = nn.Dropout(dropout)
-
-        # Highway gate
-        self.gate = nn.Linear(hidden_dim, hidden_dim)
-
-        # Bias per entity
-        self.bias = None  # Dataset yuklanganidan keyin o'rnatiladi
-
-    def set_entity_count(self, n: int, device):
-        self.bias = nn.Parameter(torch.zeros(n, device=device))
-
-    def forward(
-        self,
-        q: torch.Tensor,            # (B, H)
-        ent_emb: torch.Tensor,      # (E_count, entity_dim)
-    ) -> torch.Tensor:              # (B, E_count)
-        # Highway network
-        h = self.norm1(q)
-        gate = torch.sigmoid(self.gate(h))
-        h = gate * F.gelu(self.fc1(h)) + (1 - gate) * h  # residual
-        h = self.dropout(h)
-
-        # Project to entity space
-        h = self.norm2(self.fc2(h))  # (B, entity_dim)
-
-        # Dot-product with all entities
-        scores = h @ ent_emb.t()  # (B, E_count)
-
-        if self.bias is not None and scores.size(1) == self.bias.size(0):
-            scores = scores + self.bias.unsqueeze(0)
-
-        return scores
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4a. NEIGHBORHOOD AGGREGATOR — DaeMon-inspired DistMult + PNA
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class NeighborhoodAggregator(nn.Module):
-    """
-    DaeMon-inspired neighborhood aggregation for entity s.
-
-    Arxitektura:
-    - DistMult message function: m_i = emb(o_i) ⊙ W_r(emb(r_i))
-    - Time decay: decay_i = exp(-γ * (t - t_i))
-    - PNA aggregation: [mean, max, attn_weighted]
-    - Query-conditioned attention: a_i ∝ e_s · m_i
-    - Output: dynamic entity embedding (B, entity_dim)
-    - Context vector for query fusion (B, hidden_dim)
-
-    GRU dan farqi: GRU ketma-ketlik tartibini modellaydi (noto'g'ri
-    inductive bias). Bu modul esa qo'shnilarni TO'G'RI agregatsiyalaydi
-    (DaeMon/PathAggNet kabi).
-    """
-    def __init__(
-        self,
-        entity_dim:   int,
-        relation_dim: int,
-        hidden_dim:   int,
-        dropout:      float = 0.1,
-    ):
-        super().__init__()
-        self.entity_dim = entity_dim
-
-        # DistMult: relation projection for messages (entity_dim space)
-        self.rel_proj = nn.Linear(relation_dim, entity_dim, bias=False)
-
-        # Query-conditioned attention: e_s × W_q → attn over neighbors
-        self.attn_q = nn.Linear(entity_dim, entity_dim, bias=False)
-
-        # Time decay: learnable log-scale
-        self.log_gamma = nn.Parameter(torch.tensor(-3.0))
-
-        # PNA output: [mean, max, attn, e_s] → entity_dim
-        self.out_proj = nn.Sequential(
-            nn.Linear(entity_dim * 4, entity_dim * 2),
-            nn.LayerNorm(entity_dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(entity_dim * 2, entity_dim),
-            nn.LayerNorm(entity_dim),
-        )
-
-        # Context projection for query fusion: entity_dim → hidden_dim
-        self.ctx_proj = nn.Sequential(
-            nn.Linear(entity_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        e_emb:         torch.Tensor,  # (B, entity_dim) — static subject embedding
-        hist_ent_emb:  torch.Tensor,  # (B, H, entity_dim) — neighbor embeddings
-        hist_rel_emb:  torch.Tensor,  # (B, H, relation_dim) — relation embeddings
-        hist_time_raw: torch.Tensor,  # (B, H) — raw integer timestamps
-        query_time:    torch.Tensor,  # (B,) — raw query timestamps
-        hist_mask:     torch.Tensor,  # (B, H) bool — True = valid
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            dynamic_emb: (B, entity_dim) — neighborhood-aware entity representation
-            ctx:         (B, hidden_dim) — context vector for query fusion
-        """
-        B, H, E = hist_ent_emb.shape
-
-        # DistMult messages: e_neighbor ⊙ W_rel(r_i)
-        rel_projected = self.rel_proj(hist_rel_emb)   # (B, H, E)
-        messages      = hist_ent_emb * rel_projected  # (B, H, E)
-
-        # Time decay: exp(-γ * |t - t_i|)
-        time_diff = (query_time.float().unsqueeze(1) - hist_time_raw.float()).clamp(min=0)
-        gamma     = torch.exp(self.log_gamma)
-        decay     = torch.exp(-gamma * time_diff)     # (B, H)
-
-        # Decay applied to messages
-        messages_dec = messages * decay.unsqueeze(-1)  # (B, H, E)
-
-        # Query-conditioned attention
-        q_repr   = self.attn_q(e_emb)                           # (B, E)
-        attn_raw = torch.bmm(
-            q_repr.unsqueeze(1),                                 # (B, 1, E)
-            messages_dec.transpose(1, 2)                         # (B, E, H)
-        ).squeeze(1) / math.sqrt(E)                              # (B, H)
-
-        fill_val = -1e4 if attn_raw.dtype == torch.float16 else -1e9
-        attn_raw = attn_raw.masked_fill(~hist_mask, fill_val)
-        attn     = torch.softmax(attn_raw, dim=-1)               # (B, H)
-
-        # PNA: mean, max, attention-weighted aggregation
-        valid_f  = hist_mask.float().unsqueeze(-1)               # (B, H, 1)
-        n_valid  = hist_mask.float().sum(1, keepdim=True).clamp(min=1)
-        valid_msgs = messages * valid_f                          # (B, H, E)
-
-        mean_msg = valid_msgs.sum(1) / n_valid                   # (B, E)
-        max_msg  = valid_msgs.max(1).values                      # (B, E)
-        attn_msg = (attn.unsqueeze(-1) * messages).sum(1)        # (B, E)
-
-        # Combine with original embedding
-        combined     = torch.cat([mean_msg, max_msg, attn_msg, e_emb], dim=-1)  # (B, 4E)
-        dynamic_emb  = self.out_proj(combined)                   # (B, E)
-        dynamic_emb  = self.dropout(dynamic_emb)
-
-        # Context vector for query fusion
-        ctx = self.ctx_proj(dynamic_emb)                         # (B, hidden_dim)
-
-        return dynamic_emb, ctx
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4b. DIRECT SCORING HEAD — DistMult uslubi (WIKI/YAGO uchun)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class DirectScoringHead(nn.Module):
-    """
-    DistMult-uslubida to'g'ridan-to'g'ri baholash.
-
-    score(s, r, o, t) = (s_t ⊙ W_r * r) · o_static
-
-    Nima uchun kerak?
-    - WIKI/YAGO da kam relatsiya (10–24) → yo'llar informatif emas
-    - DistMult entity embedding larini to'g'ri o'rganadi
-    - Path encoder bilan birgalikda: yakunda ancha yaxshiroq natija
-    """
-    def __init__(
-        self,
-        entity_dim:   int,
-        relation_dim: int,
-        dropout:      float = 0.1,
-    ):
-        super().__init__()
-        # relation_dim → entity_dim proektsiyasi
-        self.rel_proj = nn.Linear(relation_dim, entity_dim, bias=False)
-        # Subject temporal embedding ni entity_dim ga moslashtirish
-        self.sub_proj = nn.Sequential(
-            nn.Linear(entity_dim, entity_dim),
-            nn.LayerNorm(entity_dim),
-            nn.GELU(),
-        )
-        self.dropout  = nn.Dropout(dropout)
-        # Per-entity bias
-        self.bias: Optional[nn.Parameter] = None
-
-    def set_entity_count(self, n: int, device):
-        self.bias = nn.Parameter(torch.zeros(n, device=device))
-
-    def forward(
-        self,
-        s_t_emb:     torch.Tensor,  # (B, entity_dim) — temporal subject
-        r_emb:       torch.Tensor,  # (B, relation_dim)
-        all_ent_emb: torch.Tensor,  # (E, entity_dim)
-    ) -> torch.Tensor:              # (B, E)
-        # DistMult: (s_t * W_r(r)) · o
-        s_proj = self.sub_proj(s_t_emb)          # (B, E)
-        r_proj = self.rel_proj(r_emb)             # (B, E)
-        interaction = self.dropout(s_proj * r_proj)  # (B, E) element-wise
-        scores = interaction @ all_ent_emb.t()    # (B, E_count)
-        if self.bias is not None and scores.size(1) == self.bias.size(0):
-            scores = scores + self.bias.unsqueeze(0)
-        return scores
-
-
-class DiachronicGating(nn.Module):
-    """
-    DE-SimplE uslubida vaqtga bog'liq entity gating.
-
-    e_t = e_static * (1 + amp * sin(freq * t + phase))
-
-    Vaqt bo'yicha ravon o'zgarish → test temporal umumlashuvini yaxshilaydi.
-    """
-    def __init__(self, entity_dim: int, num_times: int, dropout: float = 0.1):
-        super().__init__()
-        d = entity_dim
-        # Amplitude: har bir entity uchun learned
-        self.amp   = nn.Embedding(1, d)          # global amplitude
-        self.freq  = nn.Embedding(1, d)          # global frequency
-        self.phase = nn.Embedding(1, d)          # global phase
-        self.dropout = nn.Dropout(dropout)
-        nn.init.uniform_(self.amp.weight,   -0.1, 0.1)
-        nn.init.uniform_(self.freq.weight,   0.5, 2.0)
-        nn.init.uniform_(self.phase.weight, -math.pi, math.pi)
-        self.num_times = max(num_times, 1)
-
-    def forward(
-        self,
-        e_emb: torch.Tensor,  # (..., entity_dim)
-        t:     torch.Tensor,  # (...,) integer timestamps
-    ) -> torch.Tensor:        # (..., entity_dim)
-        t_norm = t.float() / self.num_times           # 0..1 ga normalize
-        # Broadcast: (..., 1) × (1, E) → (..., E)
-        t_exp = t_norm.unsqueeze(-1)
-        amp   = self.amp.weight[0]    # (E,)
-        freq  = self.freq.weight[0]   # (E,)
-        phase = self.phase.weight[0]  # (E,)
-        gate  = 1.0 + amp * torch.sin(freq * t_exp + phase)  # (..., E)
-        return self.dropout(e_emb * gate)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5. MOCO-STYLE CONTRASTIVE MODULE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class PathLevelContrastive(nn.Module):
-    """
-    Path-Level Contrastive Learning (CTPL maqolasiga mos).
-
-    Oldingi muammo:
-      query  = final_q  (path encoder orqali, 512-dim)
-      positive = ent_emb(o) (oddiy entity embedding, 256-dim)
-      → Ikki turli space → CL ≈ random baseline (8.0), hech narsa o'rganmaydi
-
-    Tuzatish (haqiqiy path-level):
-      query   = final_q  (s→...→? so'rovi, path + query fusion)
-      positive = path_repr(s→o) ning o'rtachasi  ← TO'G'RI YO'L representation
-      negative = path_repr(s→neg) lar            ← NOTO'G'RI yo'l representation
-
-    Endi ikkalasi ham bir xil space (hidden_dim) da!
-    Model "to'g'ri yo'l representation" va "noto'g'ri yo'l" ni ajratishni o'rganadi.
-    """
-    def __init__(
-        self,
-        hidden_dim: int,
-        proj_dim:   int,
-        queue_size: int   = 4096,
-        momentum:   float = 0.995,
-        temperature: float = 0.3,
-    ):
-        super().__init__()
-        self.proj_dim    = proj_dim
-        self.queue_size  = queue_size
-        self.momentum    = momentum
-        self.temperature = temperature
-
-        # Query projection: final_q (H) → proj_dim
-        self.query_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, proj_dim),
-        )
-
-        # Key projection: path_repr (H) → proj_dim
-        # Online va momentum — ikkalasi ham bir xil H-dim inputdan
-        self.key_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, proj_dim),
-        )
-
-        # Momentum encoder (EMA, gradient yo'q)
-        self.key_proj_m = copy.deepcopy(self.key_proj)
-        for p in self.key_proj_m.parameters():
-            p.requires_grad_(False)
-
-        # Negative queue: path representations
-        self.register_buffer(
-            "queue",
-            F.normalize(torch.randn(proj_dim, queue_size), dim=0)
-        )
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-
-    @torch.no_grad()
-    def _update_momentum_encoder(self):
-        for p_m, p in zip(self.key_proj_m.parameters(), self.key_proj.parameters()):
-            p_m.data = p_m.data * self.momentum + p.data * (1.0 - self.momentum)
-
-    @torch.no_grad()
-    def _enqueue(self, keys: torch.Tensor):
-        K = keys.size(0)
-        ptr = int(self.queue_ptr)
-        if ptr + K <= self.queue_size:
-            self.queue[:, ptr:ptr + K] = keys.t()
-        else:
-            end = self.queue_size - ptr
-            self.queue[:, ptr:] = keys[:end].t()
-            self.queue[:, :K - end] = keys[end:].t()
-        self.queue_ptr[0] = (ptr + K) % self.queue_size
-
-    def forward(
-        self,
-        final_q:      torch.Tensor,  # (B, H)   — query (fused)
-        pos_path_repr: torch.Tensor, # (B, H)   — to'g'ri yo'l representation
-        neg_path_repr: torch.Tensor, # (B, N, H) — noto'g'ri yo'llar
-    ) -> torch.Tensor:
-        B = final_q.size(0)
-
-        # Query projection (online, gradient oqadi)
-        q_proj = F.normalize(self.query_proj(final_q), dim=-1)  # (B, d)
-
-        # Positive key projection (momentum, gradient yo'q)
-        self._update_momentum_encoder()
-        with torch.no_grad():
-            pos_proj = self.key_proj_m(pos_path_repr)           # (B, d)
-            pos_proj = F.normalize(pos_proj, dim=-1)
-
-        # Negative key projection (online)
-        B_, N, H = neg_path_repr.shape
-        neg_flat = neg_path_repr.view(B_ * N, H)
-        neg_proj = self.key_proj(neg_flat)                       # (B*N, d)
-        neg_proj = F.normalize(neg_proj, dim=-1)
-        neg_proj = neg_proj.view(B_, N, -1)                      # (B, N, d)
-
-        # InfoNCE loss
-        pos_logit     = (q_proj * pos_proj).sum(-1, keepdim=True) / self.temperature  # (B,1)
-        neg_logit_bat = torch.bmm(
-            q_proj.unsqueeze(1), neg_proj.transpose(1, 2)
-        ).squeeze(1) / self.temperature                           # (B, N)
-        neg_logit_q   = (q_proj @ self.queue.clone().detach()) / self.temperature     # (B, Q)
-
-        logits = torch.cat([pos_logit, neg_logit_bat, neg_logit_q], dim=1)
-        labels = torch.zeros(B, dtype=torch.long, device=final_q.device)
-        loss   = F.cross_entropy(logits, labels)
-
-        self._enqueue(pos_proj.detach())
-        return loss
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 6. ASOSIY MODEL
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class EliteTKGModel(nn.Module):
-    """
-    Temporal Knowledge Graph Completion uchun to'liq model.
-
-    Forward:
-      1. (s,r,t) → TemporalEmbedding → QueryEncoder → q
-      2. paths → PathTransformerEncoder → path_repr
-      3. q + path_repr fusion → link prediction
-      4. MoCo contrastive loss
-      5. Self-adversarial loss
-    """
-
-    def __init__(
-        self,
-        num_entities:  int,
-        num_relations: int,
-        num_times:     int,
-        entity_dim:    int = 256,
-        relation_dim:  int = 256,
-        time_dim:      int = 64,
-        hidden_dim:    int = 512,
-        proj_dim:      int = 256,
-        num_heads:     int = 8,
-        num_layers:    int = 2,
-        ffn_dim:       int = 1024,
-        num_negative:  int = 256,
-        dropout:       float = 0.1,
-        temperature:   float = 0.3,
-        momentum:      float = 0.995,
-        queue_size:    int = 8192,
-        max_seq_len:   int = 16,
-        label_smoothing: float = 0.1,
-        use_direct_scoring: bool = False,
-        use_diachronic:     bool = False,
-        w_direct:           float = 0.0,
-        use_history:        bool = False,
-        use_time_encoding:  str  = "both",  # "both" | "sinusoidal"
-    ):
-        super().__init__()
-        self.num_entities       = num_entities
-        self.num_relations      = num_relations
-        self.entity_dim         = entity_dim
-        self.hidden_dim         = hidden_dim
-        self.num_negative       = num_negative
-        self.label_smoothing    = label_smoothing
-        self.use_direct_scoring = use_direct_scoring
-        self.use_diachronic     = use_diachronic
-        self.w_direct           = w_direct
-        self.use_history        = use_history
-
-        # ── 1. Embedding ──────────────────────────────────────────────────────
-        self.embeddings = TemporalEmbedding(
-            num_entities=num_entities,
-            num_relations=num_relations,
-            num_times=num_times,
-            entity_dim=entity_dim,
-            relation_dim=relation_dim,
-            time_dim=time_dim,
-            dropout=dropout,
-            use_sinusoidal_only=(use_time_encoding == "sinusoidal"),
-        )
-
-        # ── 2. Query Encoder ──────────────────────────────────────────────────
-        self.query_encoder = QueryEncoder(
-            entity_dim=entity_dim,
-            relation_dim=relation_dim,
-            time_dim=time_dim,
-            hidden_dim=hidden_dim,
-            dropout=dropout,
-        )
-
-        # ── 3. Path Encoder ───────────────────────────────────────────────────
-        step_dim = entity_dim + relation_dim + time_dim
+        # ── Path Encoder ──────────────────────────────────────────────────────
         self.path_encoder = PathTransformerEncoder(
-            entity_dim=entity_dim,
-            relation_dim=relation_dim,
-            time_dim=time_dim,
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            num_layers=num_layers,
-            ffn_dim=ffn_dim,
-            dropout=dropout,
-            max_seq_len=max_seq_len,
+            entity_dim=entity_dim, relation_dim=relation_dim,
+            delta_dim=delta_dim, hidden_dim=hidden_dim,
+            num_heads=num_heads, num_layers=num_layers,
+            ffn_dim=ffn_dim, dropout=dropout,
         )
 
-        # ── 4. Fusion: q + path_repr → final_q ───────────────────────────────
-        # Cross-attention: q nima so'rashi kerak, path_repr javob beradi
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.fusion_norm = nn.LayerNorm(hidden_dim)
-        self.fusion_ffn = nn.Sequential(
+        # ── Neighborhood modules ──────────────────────────────────────────────
+        if use_history:
+            self.pna      = QueryAdaptivePNA(entity_dim, relation_dim, delta_dim, dropout)
+            self.csa      = CrossSnapshotAttention(
+                entity_dim, relation_dim, delta_dim,
+                num_heads=min(4, num_heads), dropout=dropout,
+            )
+            self.gate_mem = GatedTemporalMemory(entity_dim, dropout)
+            self.nb_ctx   = nn.Sequential(
+                nn.Linear(entity_dim * 2, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self.hist_norm = nn.LayerNorm(hidden_dim)
+        else:
+            self.pna = self.csa = self.gate_mem = self.nb_ctx = self.hist_norm = None
+
+        # ── Cross-Path Fusion ─────────────────────────────────────────────────
+        self.cross_attn   = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        self.fusion_norm  = nn.LayerNorm(hidden_dim)
+        self.fusion_ffn   = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -791,312 +546,189 @@ class EliteTKGModel(nn.Module):
         )
         self.fusion_norm2 = nn.LayerNorm(hidden_dim)
 
-        # ── 5. Link Prediction Head ───────────────────────────────────────────
-        self.link_head = LinkPredHead(
-            hidden_dim=hidden_dim,
-            entity_dim=entity_dim,
-            dropout=dropout,
-        )
+        # ── Scoring Heads ─────────────────────────────────────────────────────
+        self.link_head   = LinkPredHead(hidden_dim, entity_dim, num_entities, dropout)
+        self.direct_head = DirectScoringHead(entity_dim, relation_dim, num_entities, dropout) \
+                           if (w_direct > 0 or use_direct_scoring) else None
 
-        # ── 6. Path-Level Contrastive ─────────────────────────────────────────
-        self.contrastive = PathLevelContrastive(
-            hidden_dim=hidden_dim,
-            proj_dim=proj_dim,
-            queue_size=queue_size,
-            momentum=momentum,
-            temperature=temperature,
-        )
-
-        # Negative entity embedding → hidden_dim (proxy path representation)
-        # entity_dim → hidden_dim, negative lar uchun ishlatiladi
-        self.neg_path_proj = nn.Sequential(
-            nn.Linear(entity_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-        )
-
-        # ── 7. Relation-specific scaling ─────────────────────────────────────
-        # Har bir relation uchun o'z temperature si
-        self.rel_temperature = nn.Embedding(num_relations, 1)
-        nn.init.constant_(self.rel_temperature.weight, 1.0)
-
-        # ── 8. Neighborhood Aggregator (DaeMon-inspired) ────────────────────────
-        if use_history:
-            self.history_encoder = NeighborhoodAggregator(
-                entity_dim   = entity_dim,
-                relation_dim = relation_dim,
-                hidden_dim   = hidden_dim,
-                dropout      = dropout,
-            )
-            # Context → query fusion: simple residual + norm
-            self.hist_gate = None                           # Artiq kerak emas
-            self.hist_norm = nn.LayerNorm(hidden_dim)
-        else:
-            self.history_encoder = None
-            self.hist_gate       = None
-            self.hist_norm       = None
-
-        # ── 9. Direct Scoring Head (WIKI/YAGO uchun) ──────────────────────────
-        if use_direct_scoring:
-            self.direct_head = DirectScoringHead(entity_dim, relation_dim, dropout)
-        else:
-            self.direct_head = None
-
-        # ── 10. Diachronic Gating (vaqt bo'yicha smooth entity embedding) ─────
+        # ── Diachronic Gating ─────────────────────────────────────────────────
         if use_diachronic:
-            self.diachronic = DiachronicGating(entity_dim, num_times, dropout)
-        else:
-            self.diachronic = None
+            self.dia_amp   = nn.Embedding(1, entity_dim)
+            self.dia_freq  = nn.Embedding(1, entity_dim)
+            self.dia_phase = nn.Embedding(1, entity_dim)
+            nn.init.uniform_(self.dia_amp.weight,   -0.1,       0.1)
+            nn.init.uniform_(self.dia_freq.weight,   0.5,       2.0)
+            nn.init.uniform_(self.dia_phase.weight, -math.pi, math.pi)
+            self.num_times_dia = max(num_times, 1)
 
-        self.dropout = nn.Dropout(dropout)
+        # ── Relation temperature ──────────────────────────────────────────────
+        self.rel_temp = nn.Embedding(num_relations, 1)
+        nn.init.constant_(self.rel_temp.weight, 1.0)
 
-        # All entity indices (eval uchun)
-        self.register_buffer(
-            "all_entity_ids",
-            torch.arange(num_entities, dtype=torch.long)
+        self.drop = nn.Dropout(dropout)
+        self.register_buffer("all_entity_ids", torch.arange(num_entities, dtype=torch.long))
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _ent(self, e):
+        return self.drop(self.ent_emb(e))
+
+    def _rel(self, r):
+        return self.drop(self.rel_emb(r.clamp(0, self.rel_emb.num_embeddings - 1)))
+
+    def _diachronic(self, e_emb: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if not self.use_diachronic:
+            return e_emb
+        t_norm = (t.float() / self.num_times_dia).unsqueeze(-1)
+        gate   = 1.0 + self.dia_amp.weight[0] * torch.sin(
+            self.dia_freq.weight[0] * t_norm + self.dia_phase.weight[0]
         )
+        return e_emb * gate
 
-    # ── Forward yordamchi metodlar ────────────────────────────────────────────
-
-    def _encode_query(self, s, r, t):
-        """(B,) → (B, H)"""
-        s_emb = self.embeddings.get_temporal_entity_emb(s, t)  # (B, E)
-        r_emb = self.embeddings.get_relation_emb(r)             # (B, R)
-        t_emb = self.embeddings.get_time_emb(t)                 # (B, T)
-        return self.query_encoder(s_emb, r_emb, t_emb)          # (B, H)
-
-    def _encode_paths(self, paths, path_masks):
-        """
-        paths:      (B, P, L, 3)  [entity, relation, time]
-        path_masks: (B, P, L)
-        → path_repr: (B, P, H)
-        """
-        B, P, L, _ = paths.shape
-
-        # Flatten: (B*P, L, 3)
-        paths_flat = paths.view(B * P, L, 3)
-        masks_flat = path_masks.view(B * P, L)
-
-        num_times = self.embeddings.time_emb_learned.num_embeddings
-        ent = paths_flat[:, :, 0]                                     # (BP, L)
-        rel = paths_flat[:, :, 1]                                     # (BP, L)
-        t   = paths_flat[:, :, 2].clamp(0, num_times - 1)            # (BP, L)
-
-        # Step embeddings
-        e_emb = self.embeddings.get_entity_emb(ent)          # (BP, L, E)
-        r_emb = self.embeddings.get_relation_emb(rel)         # (BP, L, R)
-        t_emb = self.embeddings.get_time_emb(t)               # (BP, L, T)
-
-        step_vecs = torch.cat([e_emb, r_emb, t_emb], dim=-1)  # (BP, L, E+R+T)
-
-        # Path encoding
-        path_repr = self.path_encoder(step_vecs, masks_flat)  # (BP, H)
-        return path_repr.view(B, P, -1)                        # (B, P, H)
-
-    def _fuse_query_paths(self, q, path_reprs):
-        """
-        Cross-attention: q (query) path_reprs ni attend qiladi.
-        q:           (B, H)
-        path_reprs:  (B, P, H)
-        → fused: (B, H)
-        """
-        q_expanded = q.unsqueeze(1)  # (B, 1, H)
-
-        # Cross-attention: query=q, key=value=paths
-        attn_out, _ = self.cross_attn(q_expanded, path_reprs, path_reprs)
-        # attn_out: (B, 1, H)
-
-        # Residual + norm
-        fused = self.fusion_norm(q_expanded + attn_out)          # (B, 1, H)
-        fused = self.fusion_norm2(fused + self.fusion_ffn(fused)) # (B, 1, H)
-        return fused.squeeze(1)                                    # (B, H)
-
-    def _self_adversarial_loss(self, scores, targets, neg_objs):
-        """
-        Self-adversarial negative sampling loss.
-        Negative ballarga softmax og'irligi beriladi:
-        L = -Σ p(neg_i) * log σ(-score(neg_i))
-        Bu murakkab negativlarga ko'proq e'tibor beradi.
-        """
-        B = scores.size(0)
-        device = scores.device
-
-        if neg_objs.size(1) == 0:
-            return torch.tensor(0.0, device=device)
-
-        # Negative scores: (B, N)
-        N = neg_objs.size(1)
-        neg_scores = scores.gather(1, neg_objs)  # (B, N)
-
-        # Self-adversarial weight: softmax over negative scores
-        with torch.no_grad():
-            weights = F.softmax(neg_scores * 0.5, dim=-1)  # (B, N)
-
-        # Log sigmoid loss
-        neg_loss = -(weights * F.logsigmoid(-neg_scores)).sum(dim=-1).mean()
-
-        # Positive loss
-        pos_scores = scores.gather(1, targets.unsqueeze(1))  # (B, 1)
-        pos_loss = -F.logsigmoid(pos_scores).mean()
-
-        return pos_loss + neg_loss
-
-    # ── Asosiy forward ────────────────────────────────────────────────────────
-
-    def _compute_neighborhood(
+    def _encode_query(
         self,
-        subjects:  torch.Tensor,   # (B,)
-        times:     torch.Tensor,   # (B,)
-        history:   torch.Tensor,   # (B, H, 3) — [entity, relation, time]
-        hist_mask: torch.Tensor,   # (B, H)
+        subjects:  torch.Tensor,
+        relations: torch.Tensor,
+        times:     torch.Tensor,
+    ) -> torch.Tensor:
+        s_emb  = self._ent(subjects)
+        r_emb  = self._rel(relations)
+        d_zero = self.delta_enc(torch.zeros(subjects.size(0), dtype=torch.long, device=subjects.device))
+        return self.query_encoder(torch.cat([s_emb, r_emb, d_zero], dim=-1))
+
+    def _encode_paths(
+        self,
+        paths:      torch.Tensor,  # (B, P, L, 3)
+        path_masks: torch.Tensor,  # (B, P, L)
+        query_t:    torch.Tensor,  # (B,)
+    ) -> torch.Tensor:             # (B, P, H)
+        B, P, L, _ = paths.shape
+        paths_f = paths.view(B * P, L, 3)
+        masks_f = path_masks.view(B * P, L)
+
+        ent = paths_f[:, :, 0]
+        rel = paths_f[:, :, 1]
+        t_h = paths_f[:, :, 2]
+
+        t_q  = query_t.unsqueeze(1).expand(-1, P).contiguous().view(B * P)  # (BP,)
+        dt   = (t_q.unsqueeze(1) - t_h.float()).clamp(min=0).long()         # (BP, L)
+
+        e_emb = self.ent_emb(ent)
+        r_emb = self.rel_emb(rel.clamp(0, self.rel_emb.num_embeddings - 1))
+        d_emb = self.delta_enc(dt)
+
+        step  = torch.cat([e_emb, r_emb, d_emb], dim=-1)
+        repr_ = self.path_encoder(step, masks_f)
+        return repr_.view(B, P, -1)
+
+    def _process_neighborhood(
+        self,
+        subjects:  torch.Tensor,
+        relations: torch.Tensor,
+        times:     torch.Tensor,
+        history:   torch.Tensor,  # (B, H, 3)
+        hist_mask: torch.Tensor,  # (B, H)
+        s_emb:     torch.Tensor,  # (B, E)
+        r_emb:     torch.Tensor,  # (B, R)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        NeighborhoodAggregator: entity s uchun dinamik embedding va kontekst.
+        """Returns: (s_dynamic (B,E), ctx (B,hidden_dim))"""
+        hist_ent = history[:, :, 0]
+        hist_rel = history[:, :, 1]
+        hist_t   = history[:, :, 2]
 
-        Returns:
-            dynamic_emb: (B, entity_dim) — neighborhood-aware entity embedding
-            ctx:         (B, hidden_dim) — context for query fusion
-        """
-        num_times = self.embeddings.time_emb_learned.num_embeddings
+        delta_t  = (times.unsqueeze(1) - hist_t.float()).clamp(min=0).long()
+        delta_enc = self.delta_enc(delta_t)
 
-        hist_ent = history[:, :, 0]                            # (B, H) int
-        hist_rel = history[:, :, 1]                            # (B, H) int
-        hist_tm  = history[:, :, 2]                            # (B, H) raw int (time decay uchun)
+        nb_e = self.ent_emb(hist_ent)
+        nb_r = self.rel_emb(hist_rel.clamp(0, self.rel_emb.num_embeddings - 1))
 
-        # Subject static embedding
-        s_emb = self.embeddings.get_entity_emb(subjects)       # (B, E)
+        # A) Query-Adaptive PNA
+        pna_out = self.pna(s_emb, nb_e, nb_r, delta_t, r_emb, hist_mask)
 
-        # Neighbor embeddings (lookup)
-        nb_emb = self.embeddings.get_entity_emb(hist_ent)      # (B, H, E)
-        r_emb  = self.embeddings.get_relation_emb(hist_rel)    # (B, H, R)
+        # B) Cross-Snapshot Attention
+        messages = nb_e * self.pna.rel_proj(nb_r)
+        csa_out  = self.csa(messages, nb_e, delta_enc, r_emb, s_emb, hist_mask)
 
-        return self.history_encoder(
-            s_emb,       # (B, E)
-            nb_emb,      # (B, H, E)
-            r_emb,       # (B, H, R)
-            hist_tm,     # (B, H) raw timestamps
-            times,       # (B,) raw query timestamps
-            hist_mask,   # (B, H)
-        )  # → (dynamic_emb (B,E), ctx (B,H_dim))
+        # C) Tawaregate memory: fuse PNA + CSA then gate with static
+        combined   = (pna_out + csa_out) * 0.5
+        s_dynamic  = self.gate_mem(s_emb, combined)
+
+        ctx = self.nb_ctx(torch.cat([s_dynamic, s_emb], dim=-1))
+        return s_dynamic, ctx
+
+    # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(
         self,
-        subjects:   torch.Tensor,    # (B,)
-        relations:  torch.Tensor,    # (B,)
-        objects:    torch.Tensor,    # (B,)
-        times:      torch.Tensor,    # (B,)
-        paths:      torch.Tensor,    # (B, P, L, 3)
-        path_masks: torch.Tensor,    # (B, P, L)
-        neg_objects: torch.Tensor,   # (B, N) — negative entities
-        history:    Optional[torch.Tensor] = None,  # (B, H, 3)
-        hist_mask:  Optional[torch.Tensor] = None,  # (B, H)
+        subjects:    torch.Tensor,
+        relations:   torch.Tensor,
+        objects:     torch.Tensor,
+        times:       torch.Tensor,
+        paths:       torch.Tensor,
+        path_masks:  torch.Tensor,
+        neg_objects: torch.Tensor,
+        history:     Optional[torch.Tensor] = None,
+        hist_mask:   Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Returns:
-            scores:   (B, num_entities) — link prediction
-            losses:   {"link": t, "contrastive": t, "self_adv": t}
-        """
-        B = subjects.size(0)
+
+        B      = subjects.size(0)
         device = subjects.device
 
-        # ── 1. Query encoding ─────────────────────────────────────────────────
-        q = self._encode_query(subjects, relations, times)  # (B, H)
+        s_emb = self._ent(subjects)
+        r_emb = self._rel(relations)
 
-        # ── 1b. Neighborhood Aggregation ─────────────────────────────────────
-        s_dynamic = None   # (B, entity_dim) — dynamic entity emb (neighborhoods)
-        if self.history_encoder is not None and history is not None:
-            s_dynamic, ctx = self._compute_neighborhood(
-                subjects, times, history, hist_mask
-            )                                                # ctx: (B, H_dim)
-            # Simple residual fusion: q += neighborhood context
-            q = self.hist_norm(q + ctx)                      # (B, H)
+        # ── Query ─────────────────────────────────────────────────────────────
+        q = self._encode_query(subjects, relations, times)
 
-        # ── 2. Path encoding ──────────────────────────────────────────────────
-        path_reprs = self._encode_paths(paths, path_masks)  # (B, P, H)
+        # ── Neighborhood ──────────────────────────────────────────────────────
+        s_dynamic = None
+        if self.use_history and history is not None:
+            s_dynamic, ctx = self._process_neighborhood(
+                subjects, relations, times, history, hist_mask, s_emb, r_emb
+            )
+            q = self.hist_norm(q + ctx)
 
-        # ── 3. Fusion ─────────────────────────────────────────────────────────
-        final_q = self._fuse_query_paths(q, path_reprs)     # (B, H)
+        # ── Paths ─────────────────────────────────────────────────────────────
+        path_reprs = self._encode_paths(paths, path_masks, times)
 
-        # ── 4. Link prediction ────────────────────────────────────────────────
-        all_ent_emb = self.embeddings.get_entity_emb(self.all_entity_ids)  # (E, dim)
-        scores = self.link_head(final_q, all_ent_emb)                       # (B, E)
+        # ── Cross-path fusion ─────────────────────────────────────────────────
+        q_exp = q.unsqueeze(1)
+        attn_out, _ = self.cross_attn(q_exp, path_reprs, path_reprs)
+        fused = self.fusion_norm(q_exp + attn_out)
+        fused = self.fusion_norm2(fused + self.fusion_ffn(fused))
+        final_q = fused.squeeze(1)
 
-        # Relation-specific temperature scaling
-        rel_temp = self.rel_temperature(relations).squeeze(-1)  # (B,)
-        scores = scores * rel_temp.unsqueeze(1)
+        # ── Scoring ───────────────────────────────────────────────────────────
+        all_ent = self.ent_emb(self.all_entity_ids)
+        scores  = self.link_head(final_q, all_ent)
+        scores  = scores * self.rel_temp(relations).squeeze(-1).unsqueeze(1)
 
-        # ── 4b. Direct scoring (DistMult) — WIKI/YAGO uchun ──────────────────
-        if self.direct_head is not None and self.w_direct > 0.0:
-            # CRITICAL: Use DYNAMIC entity embedding if available (neighborhood-aware)
-            # This is the key improvement over static embeddings
-            if s_dynamic is not None:
-                s_t_emb = s_dynamic                                         # (B, E) DYNAMIC
-            else:
-                s_t_emb = self.embeddings.get_temporal_entity_emb(subjects, times)  # (B, E)
-            r_emb_d = self.embeddings.get_relation_emb(relations)               # (B, R)
-            # Diachronic gating (agar yoqilgan bo'lsa)
-            if self.diachronic is not None:
-                s_t_emb = self.diachronic(s_t_emb, times)
-            direct_scores = self.direct_head(s_t_emb, r_emb_d, all_ent_emb)   # (B, E)
-            scores = scores + self.w_direct * direct_scores
+        if self.direct_head is not None:
+            s_t = s_dynamic if s_dynamic is not None else self.ent_emb(subjects)
+            s_t = self._diachronic(s_t, times)
+            scores = scores + self.w_direct * self.direct_head(s_t, r_emb, all_ent)
 
-        # ── 5. Link prediction loss (label smoothing bilan) ───────────────────
-        link_loss = F.cross_entropy(
-            scores, objects,
-            label_smoothing=self.label_smoothing,
-        )
+        # ── Losses ────────────────────────────────────────────────────────────
+        link_loss = F.cross_entropy(scores, objects, label_smoothing=self.label_smoothing)
 
-        # ── 6. Path-Level Contrastive loss ───────────────────────────────────
-        # Positive: s→o yo'llarining path representation (mean pooling)
-        # Negative: s→neg_i yo'llarining path representation
-        # Ikkalasi ham bir xil hidden_dim space da → haqiqiy path-level CL
-
-        # Positive path representation:
-        # path_reprs (B, P, H) — bu allaqachon s→o yo'llari encode qilingan
-        # (lekin oxirgi hop olib tashlangan, shuning uchun to'g'ri)
-        pos_path_repr = path_reprs.mean(dim=1)  # (B, H) — P ta yo'lning o'rtachasi
-
-        # Negative path representations:
-        # Negative entitylar uchun ham path_reprs tuzish kerak.
-        # Soddalashtirilgan: query encoder orqali negative entity embedding larini
-        # hidden_dim ga ko'taramiz (proxy negative representation)
         if neg_objects.size(1) > 0:
-            N = neg_objects.size(1)
-            # Neg entity temporal embedding → (B, N, entity_dim)
-            neg_ent_t = self.embeddings.get_temporal_entity_emb(
-                neg_objects.view(-1),
-                times.unsqueeze(1).expand(-1, N).contiguous().view(-1)
-            ).view(B, N, -1)                                    # (B, N, E)
-            # Entity_dim → hidden_dim (neg_proj layer)
-            neg_path_repr = self.neg_path_proj(neg_ent_t)       # (B, N, H)
+            neg_s = scores.gather(1, neg_objects)
+            with torch.no_grad():
+                w = F.softmax(neg_s * 0.5, dim=-1)
+            adv = -(w * F.logsigmoid(-neg_s)).sum(-1).mean()
+            adv = adv - F.logsigmoid(scores.gather(1, objects.unsqueeze(1))).mean()
         else:
-            neg_idx = torch.randint(0, self.num_entities, (B, 64), device=device)
-            neg_ent_t = self.embeddings.get_temporal_entity_emb(
-                neg_idx.view(-1), times.unsqueeze(1).expand(-1, 64).contiguous().view(-1)
-            ).view(B, 64, -1)
-            neg_path_repr = self.neg_path_proj(neg_ent_t)       # (B, 64, H)
+            adv = torch.tensor(0.0, device=device)
 
-        contrastive_loss = self.contrastive(final_q, pos_path_repr, neg_path_repr)
-
-        # ── 7. Self-adversarial loss ──────────────────────────────────────────
-        if neg_objects.size(1) > 0:
-            self_adv_loss = self._self_adversarial_loss(scores, objects, neg_objects)
-        else:
-            self_adv_loss = torch.tensor(0.0, device=device)
-
-        # ── 8. Orthogonal regularization (DaeMon kabi) — WIKI/YAGO uchun ──────
-        # Relation embedding larini ortogonal bo'lishga undaydi:
-        # ||R·Rᵀ - I||₂  → kam relatsiyali dataset larda kuchli regularizator
-        rel_w = self.embeddings.rel_emb.weight  # (R, dim)
-        tmp   = rel_w @ rel_w.t()               # (R, R)
-        I     = torch.eye(tmp.size(0), device=device)
-        ortho_reg = torch.norm(tmp - I, p=2)
+        rel_w  = self.rel_emb.weight
+        tmp    = rel_w @ rel_w.t()
+        ortho  = torch.norm(tmp - torch.eye(tmp.size(0), device=device), p=2)
 
         losses = {
             "link":        link_loss,
-            "contrastive": contrastive_loss,
-            "self_adv":    self_adv_loss,
-            "ortho_reg":   ortho_reg,
+            "contrastive": torch.tensor(0.0, device=device),
+            "self_adv":    adv,
+            "ortho_reg":   ortho,
         }
         return scores, losses
 
@@ -1112,32 +744,38 @@ class EliteTKGModel(nn.Module):
         path_masks: torch.Tensor,
         history:    Optional[torch.Tensor] = None,
         hist_mask:  Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:          # (B, num_entities)
+    ) -> torch.Tensor:
+
+        s_emb = self._ent(subjects)
+        r_emb = self._rel(relations)
+
         q = self._encode_query(subjects, relations, times)
 
-        # Neighborhood aggregation
         s_dynamic = None
-        if self.history_encoder is not None and history is not None:
-            s_dynamic, ctx = self._compute_neighborhood(subjects, times, history, hist_mask)
+        if self.use_history and history is not None:
+            s_dynamic, ctx = self._process_neighborhood(
+                subjects, relations, times, history, hist_mask, s_emb, r_emb
+            )
             q = self.hist_norm(q + ctx)
 
-        path_reprs  = self._encode_paths(paths, path_masks)
-        final_q     = self._fuse_query_paths(q, path_reprs)
-        all_ent_emb = self.embeddings.get_entity_emb(self.all_entity_ids)
-        scores      = self.link_head(final_q, all_ent_emb)
-        rel_temp    = self.rel_temperature(relations).squeeze(-1)
-        scores      = scores * rel_temp.unsqueeze(1)
+        path_reprs  = self._encode_paths(paths, path_masks, times)
+        q_exp       = q.unsqueeze(1)
+        attn_out, _ = self.cross_attn(q_exp, path_reprs, path_reprs)
+        fused       = self.fusion_norm(q_exp + attn_out)
+        fused       = self.fusion_norm2(fused + self.fusion_ffn(fused))
+        final_q     = fused.squeeze(1)
 
-        # Direct scoring — DYNAMIC entity embedding when available
-        if self.direct_head is not None and self.w_direct > 0.0:
-            if s_dynamic is not None:
-                s_t_emb = s_dynamic
-            else:
-                s_t_emb = self.embeddings.get_temporal_entity_emb(subjects, times)
-            r_emb_d = self.embeddings.get_relation_emb(relations)
-            if self.diachronic is not None:
-                s_t_emb = self.diachronic(s_t_emb, times)
-            direct_scores = self.direct_head(s_t_emb, r_emb_d, all_ent_emb)
-            scores = scores + self.w_direct * direct_scores
+        all_ent = self.ent_emb(self.all_entity_ids)
+        scores  = self.link_head(final_q, all_ent)
+        scores  = scores * self.rel_temp(relations).squeeze(-1).unsqueeze(1)
+
+        if self.direct_head is not None:
+            s_t = s_dynamic if s_dynamic is not None else self.ent_emb(subjects)
+            s_t = self._diachronic(s_t, times)
+            scores = scores + self.w_direct * self.direct_head(s_t, r_emb, all_ent)
 
         return scores
+
+
+# Backward compatibility
+EliteTKGModel = STORMModel

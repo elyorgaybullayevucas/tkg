@@ -1,4 +1,4 @@
-# config.py — TKG Elite Model konfiguratsiyasi
+# config.py — STORM Model konfiguratsiyasi
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -10,78 +10,75 @@ class Config:
     data_dir:  str = "data"
 
     # ── Embedding o'lchamlari ─────────────────────────────────────────────────
-    entity_dim:   int = 256    # entity embedding
-    relation_dim: int = 256    # relation embedding
-    time_dim:     int = 64     # vaqt embedding
-    hidden_dim:   int = 512    # GRU / Transformer hidden
-    proj_dim:     int = 256    # contrastive projection space
+    entity_dim:   int = 256
+    relation_dim: int = 256
+    delta_dim:    int = 64     # Relative Δt encoding o'lchami
+    hidden_dim:   int = 512
+    # (eski time_dim, proj_dim lar backward compat uchun saqlanadi)
+    time_dim:     int = 64
+    proj_dim:     int = 256
 
     # ── Encoder ───────────────────────────────────────────────────────────────
-    encoder_type:   str = "transformer"  # "gru" | "transformer"
-    num_layers:     int = 2
-    num_heads:      int = 8              # Transformer heads
-    ffn_dim:        int = 1024           # Transformer FFN
-    dropout:        float = 0.1
-    max_seq_len:    int = 16             # max path uzunligi
+    num_layers:   int   = 2
+    num_heads:    int   = 8
+    ffn_dim:      int   = 1024
+    dropout:      float = 0.1
 
     # ── Path sampling ─────────────────────────────────────────────────────────
-    num_paths:      int = 8
-    max_path_len:   int = 3
-
-    # ── Contrastive ───────────────────────────────────────────────────────────
-    num_negative:   int = 256
-    temperature:    float = 0.3          # optimal: 0.1-0.5
-    momentum:       float = 0.995        # MoCo-style EMA encoder
-    queue_size:     int = 8192           # negative queue (MoCo)
-    use_moco:       bool = True          # MoCo v2 style contrastive
-
-    # ── Temporal encoding ─────────────────────────────────────────────────────
-    use_time_encoding: str = "learned"   # "learned" | "sinusoidal" | "both"
-    time_granularity:  int = 1           # vaqt granulyarligi
+    num_paths:    int = 8
+    max_path_len: int = 3
+    max_seq_len:  int = 16
 
     # ── Training ──────────────────────────────────────────────────────────────
-    batch_size:     int = 512
-    num_epochs:     int = 50
-    learning_rate:  float = 3e-4
-    weight_decay:   float = 1e-4
-    grad_clip:      float = 1.0
-    warmup_steps:   int = 1000           # qadamlar soni (epochlar emas)
+    batch_size:      int   = 512
+    num_epochs:      int   = 50
+    learning_rate:   float = 3e-4
+    weight_decay:    float = 1e-4
+    grad_clip:       float = 1.0
     label_smoothing: float = 0.1
+    num_negative:    int   = 256
 
     # ── Loss weights ──────────────────────────────────────────────────────────
-    w_link:         float = 1.0          # link prediction loss
-    w_contrastive:  float = 0.5          # contrastive loss
-    w_self_adv:     float = 0.5          # self-adversarial negative sampling
-    w_direct:       float = 0.0          # DistMult direct scoring (WIKI/YAGO uchun 1.0+)
-    w_ortho_reg:    float = 0.0          # Orthogonal regularization (WIKI/YAGO uchun 0.01)
+    w_link:        float = 1.0
+    w_contrastive: float = 0.0   # STORM da contrastive yo'q
+    w_self_adv:    float = 0.5
+    w_direct:      float = 0.0
+    w_ortho_reg:   float = 0.0
 
-    # ── Direct scoring ────────────────────────────────────────────────────────
-    use_direct_scoring: bool = False     # DistMult-style to'g'ridan scoring
-    use_diachronic:     bool = False     # DE-SimplE style temporal gating
+    # ── Direct scoring & Diachronic ───────────────────────────────────────────
+    use_direct_scoring: bool = False
+    use_diachronic:     bool = False
 
-    # ── Temporal History (RE-GCN uslubi) ─────────────────────────────────────
-    use_history:    bool = False         # Entity tarixini agregatsiyalash
-    max_history:    int  = 16            # Har entity uchun max tarix uzunligi
-    use_reciprocal: bool = False         # Teskari tripllarni ham o'qitish
+    # ── Temporal History ──────────────────────────────────────────────────────
+    use_history:    bool = False
+    max_history:    int  = 16
+    use_reciprocal: bool = False
+
+    # ── Backward compat (STORM da ishlatilmaydi) ──────────────────────────────
+    temperature:        float = 0.3
+    momentum:           float = 0.995
+    queue_size:         int   = 8192
+    use_moco:           bool  = False
+    use_time_encoding:  str   = "sinusoidal"
 
     # ── Evaluation ────────────────────────────────────────────────────────────
-    eval_every:     int = 1
-    hits_at_k:      List[int] = field(default_factory=lambda: [1, 3, 10])
-    filter_flag:    bool = True
+    eval_every:  int       = 1
+    hits_at_k:   List[int] = field(default_factory=lambda: [1, 3, 10])
+    filter_flag: bool      = True
 
     # ── System ────────────────────────────────────────────────────────────────
-    device:         str = "cuda"
-    seed:           int = 42
-    num_workers:    int = 4
-    save_dir:       str = "checkpoints"
-    log_dir:        str = "logs"
-    resume:         Optional[str] = None
-    fp16:           bool = True          # mixed precision
+    device:      str           = "cuda"
+    seed:        int           = 42
+    num_workers: int           = 4
+    save_dir:    str           = "checkpoints"
+    log_dir:     str           = "logs"
+    resume:      Optional[str] = None
+    fp16:        bool          = True
 
-    # Runtime (dataset yuklanganidan keyin to'ldiriladi)
-    num_entities:   int = 0
-    num_relations:  int = 0
-    num_times:      int = 0
+    # Runtime
+    num_entities:  int = 0
+    num_relations: int = 0
+    num_times:     int = 0
 
 
 DATASET_STATS = {
