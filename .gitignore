@@ -28,3 +28,4 @@ data/*
 # Env
 .env
 myenv/
+*.md
