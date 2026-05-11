@@ -401,16 +401,15 @@ class ORIONModel(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        self.num_entities       = num_entities
-        self.num_base_relations = num_relations   # ortho_reg uchun kerak
-        self.entity_dim         = entity_dim
-        self.hidden_dim         = hidden_dim
-        self.num_negative       = num_negative
-        self.label_smoothing    = label_smoothing
-        self.w_direct           = w_direct
-        self.w_pattern_div      = w_pattern_div
-        self.use_history        = use_history
-        self.use_diachronic     = use_diachronic
+        self.num_entities    = num_entities
+        self.entity_dim      = entity_dim
+        self.hidden_dim      = hidden_dim
+        self.num_negative    = num_negative
+        self.label_smoothing = label_smoothing
+        self.w_direct        = w_direct
+        self.w_pattern_div   = w_pattern_div
+        self.use_history     = use_history
+        self.use_diachronic  = use_diachronic
 
         # ── Embeddings ────────────────────────────────────────────────────────
         self.ent_emb = nn.Embedding(num_entities,      entity_dim,   padding_idx=0)
@@ -457,11 +456,10 @@ class ORIONModel(nn.Module):
                 nn.Linear(entity_dim * 2, hidden_dim),
                 nn.LayerNorm(hidden_dim), nn.GELU(), nn.Dropout(dropout),
             )
-            self.hist_norm       = nn.LayerNorm(hidden_dim)  # hist_signal normalisation
-            self.query_hist_norm = nn.LayerNorm(hidden_dim)  # query+hist injection (alohida!)
+            self.hist_norm = nn.LayerNorm(hidden_dim)
         else:
             self.relation_profile = self.hist_transformer = self.hist_to_entity = None
-            self.gate_mem = self.nb_ctx = self.hist_norm = self.query_hist_norm = None
+            self.gate_mem = self.nb_ctx = self.hist_norm = None
 
         # ── Path Encoder (entity-independent) ─────────────────────────────────
         self.path_encoder = TemporalTransformer(
@@ -609,7 +607,7 @@ class ORIONModel(nn.Module):
             s_dynamic, hist_signal = self._process_history(
                 times, history, hist_mask, s_emb, r_emb
             )
-            q = self.query_hist_norm(q + hist_signal)  # alohida norm — hist_norm bilan aralashmasin
+            q = self.hist_norm(q + hist_signal)  # inject history into query
 
         # ── Path encoding ─────────────────────────────────────────────────────
         path_reprs = self._encode_paths(paths, path_masks, times)   # (B, P, H)
@@ -651,12 +649,9 @@ class ORIONModel(nn.Module):
         else:
             adv = torch.tensor(0.0, device=device)
 
-        # ortho_reg: faqat asosiy relatsiyalar, normalize qilingan (katta tensordan qochish)
-        n_base = min(self.num_base_relations, 64)   # Ko'pi bilan 64 ta (ICEWS tezligi uchun)
-        rel_w  = F.normalize(self.rel_emb.weight[:n_base], dim=-1)
-        tmp    = rel_w @ rel_w.t()                  # (n_base, n_base)
-        eye_n  = torch.eye(n_base, device=device)
-        ortho  = (tmp - eye_n).pow(2).mean()        # MSE, norm2 emas — stabil
+        rel_w = self.rel_emb.weight
+        tmp   = rel_w @ rel_w.t()
+        ortho = torch.norm(tmp - torch.eye(tmp.size(0), device=device), p=2)
 
         # Pattern diversity regularization [NOVEL]
         pattern_div = self.pattern_lib.diversity_loss()
@@ -692,7 +687,7 @@ class ORIONModel(nn.Module):
             s_dynamic, hist_signal = self._process_history(
                 times, history, hist_mask, s_emb, r_emb
             )
-            q = self.query_hist_norm(q + hist_signal)  # alohida norm
+            q = self.hist_norm(q + hist_signal)
 
         path_reprs  = self._encode_paths(paths, path_masks, times)
         q_exp       = q.unsqueeze(1)

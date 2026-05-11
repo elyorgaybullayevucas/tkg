@@ -98,106 +98,8 @@ def main():
 
     logger.info(f"Device: {cfg.device}  |  FP16: {cfg.fp16}")
 
-    # ── Dataset-specific sozlamalar — dm.setup() DAN OLDIN! ─────────────────────
-    # (use_reciprocal, max_history kabi parametrlar dataset yuklanishidan oldin kerak)
-    if cfg.dataset == "GDELT":
-        cfg.num_paths          = 3
-        cfg.max_path_len       = 2
-        cfg.batch_size         = 512
-        cfg.num_negative       = 256
-        cfg.use_history        = True
-        cfg.max_history        = 32        # (512,32,256) = 4M elems — GPU safe
-        cfg.use_direct_scoring = True
-        cfg.use_diachronic     = True
-        cfg.use_reciprocal     = True      # ★ teskari tripllar — katta ta'sir
-        cfg.w_direct           = 1.0
-        cfg.w_link             = 1.0
-        cfg.w_self_adv         = 0.5
-        cfg.w_ortho_reg        = 0.001
-        cfg.dropout            = 0.1
-        cfg.label_smoothing    = 0.1
-        cfg.weight_decay       = 1e-4
-        cfg.learning_rate      = 3e-4
-        cfg.num_epochs         = 30
-        logger.info(
-            "GDELT: num_paths=3, max_path_len=2, batch_size=512, "
-            "use_history=True, max_history=32, reciprocal=True, epochs=30"
-        )
-
-    elif cfg.dataset in ("WIKI", "YAGO", "YAGOs"):
-        cfg.num_paths          = 8
-        cfg.max_path_len       = 3
-        cfg.batch_size         = 256
-        cfg.num_negative       = 256
-        cfg.use_history        = True
-        cfg.max_history        = 64
-        cfg.use_direct_scoring = True
-        cfg.use_diachronic     = True
-        cfg.use_reciprocal     = True      # ★ teskari tripllar — katta ta'sir
-        cfg.w_direct           = 2.0
-        cfg.w_link             = 1.0
-        cfg.w_self_adv         = 0.5
-        cfg.w_ortho_reg        = 0.001
-        cfg.dropout            = 0.15
-        cfg.label_smoothing    = 0.1
-        cfg.weight_decay       = 1e-4
-        cfg.learning_rate      = 5e-4
-        cfg.num_epochs         = 500
-        logger.info(
-            f"{cfg.dataset}: use_history=True, max_history=64, reciprocal=True, "
-            f"DirectScoring=True, Diachronic=True, w_direct=2.0, epochs=500, LR=5e-4"
-        )
-
-    elif cfg.dataset == "ICEWS18":
-        cfg.num_paths          = 8
-        cfg.max_path_len       = 3
-        cfg.batch_size         = 512
-        cfg.num_negative       = 256
-        cfg.use_history        = True
-        cfg.max_history        = 64
-        cfg.use_direct_scoring = True
-        cfg.use_diachronic     = True
-        cfg.use_reciprocal     = True      # ★ teskari tripllar — katta ta'sir
-        cfg.w_direct           = 1.0
-        cfg.w_link             = 1.0
-        cfg.w_self_adv         = 0.5
-        cfg.w_ortho_reg        = 0.001
-        cfg.dropout            = 0.1
-        cfg.label_smoothing    = 0.1
-        cfg.weight_decay       = 1e-4
-        cfg.learning_rate      = 3e-4
-        cfg.num_epochs         = 50
-        logger.info(
-            "ICEWS18: use_history=True, max_history=64, reciprocal=True, "
-            "DirectScoring=True, Diachronic=True, w_direct=1.0, epochs=50"
-        )
-
-    elif cfg.dataset == "ICEWS14":
-        cfg.num_paths          = 8
-        cfg.max_path_len       = 3
-        cfg.batch_size         = 512
-        cfg.num_negative       = 256
-        cfg.use_history        = True
-        cfg.max_history        = 64
-        cfg.use_direct_scoring = True
-        cfg.use_diachronic     = True
-        cfg.use_reciprocal     = True      # ★ teskari tripllar — katta ta'sir
-        cfg.w_direct           = 1.0
-        cfg.w_link             = 1.0
-        cfg.w_self_adv         = 0.5
-        cfg.w_ortho_reg        = 0.001
-        cfg.dropout            = 0.1
-        cfg.label_smoothing    = 0.1
-        cfg.weight_decay       = 1e-4
-        cfg.learning_rate      = 3e-4
-        cfg.num_epochs         = 50
-        logger.info(
-            "ICEWS14: use_history=True, max_history=64, reciprocal=True, "
-            "DirectScoring=True, Diachronic=True, w_direct=1.0, epochs=50"
-        )
-
-    # ── DataModule — dataset config KEYIN yuklanadi ───────────────────────────
-    logger.info(f"Dataset yuklanmoqda: {cfg.dataset}  (reciprocal={cfg.use_reciprocal})")
+    # ── DataModule ────────────────────────────────────────────────────────────
+    logger.info(f"Dataset yuklanmoqda: {cfg.dataset}")
     dm = TKGDataModule(cfg)
     dm.setup()
     logger.info(
@@ -211,6 +113,99 @@ def main():
         f"Valid:{len(dm.valid_ds):,}  "
         f"Test:{len(dm.test_ds):,}"
     )
+
+    # ── Dataset-specific sozlamalar (elif — bir-biriga ta'sir qilmaydi) ─────────
+    if cfg.dataset == "GDELT":
+        cfg.num_paths          = 3
+        cfg.max_path_len       = 2
+        cfg.batch_size         = 512
+        cfg.num_negative       = 256
+        cfg.use_history        = True
+        cfg.max_history        = 32        # (512,32,256) = 4M elems — GPU safe
+        cfg.use_direct_scoring = True
+        cfg.use_diachronic     = True
+        cfg.w_direct           = 1.0
+        cfg.w_link             = 1.0
+        cfg.w_self_adv         = 0.5
+        cfg.w_ortho_reg        = 0.01
+        cfg.dropout            = 0.1
+        cfg.label_smoothing    = 0.1
+        cfg.weight_decay       = 1e-4
+        cfg.learning_rate      = 3e-4
+        cfg.num_epochs         = 30
+        logger.info(
+            "GDELT: num_paths=3, max_path_len=2, batch_size=512, "
+            "use_history=True, max_history=32, DirectScoring=True, Diachronic=True, epochs=30"
+        )
+
+    elif cfg.dataset in ("WIKI", "YAGO", "YAGOs"):
+        cfg.num_paths          = 8
+        cfg.max_path_len       = 3
+        cfg.batch_size         = 256
+        cfg.num_negative       = 256
+        cfg.use_history        = True
+        cfg.max_history        = 64
+        cfg.use_direct_scoring = True
+        cfg.use_diachronic     = True
+        cfg.w_direct           = 2.0
+        cfg.w_link             = 1.0
+        cfg.w_self_adv         = 0.5
+        cfg.w_ortho_reg        = 0.02
+        cfg.dropout            = 0.15
+        cfg.label_smoothing    = 0.1
+        cfg.weight_decay       = 1e-4
+        cfg.learning_rate      = 5e-4
+        cfg.num_epochs         = 500
+        logger.info(
+            f"{cfg.dataset}: use_history=True, max_history=64, "
+            f"DirectScoring=True, Diachronic=True, w_direct=2.0, epochs=500, LR=5e-4"
+        )
+
+    elif cfg.dataset == "ICEWS18":
+        cfg.num_paths          = 8
+        cfg.max_path_len       = 3
+        cfg.batch_size         = 512
+        cfg.num_negative       = 256
+        cfg.use_history        = True
+        cfg.max_history        = 64
+        cfg.use_direct_scoring = True
+        cfg.use_diachronic     = True
+        cfg.w_direct           = 1.0
+        cfg.w_link             = 1.0
+        cfg.w_self_adv         = 0.5
+        cfg.w_ortho_reg        = 0.01
+        cfg.dropout            = 0.1
+        cfg.label_smoothing    = 0.1
+        cfg.weight_decay       = 1e-4
+        cfg.learning_rate      = 3e-4
+        cfg.num_epochs         = 50
+        logger.info(
+            "ICEWS18: use_history=True, max_history=64, "
+            "DirectScoring=True, Diachronic=True, w_direct=1.0, epochs=50"
+        )
+
+    elif cfg.dataset == "ICEWS14":
+        cfg.num_paths          = 8
+        cfg.max_path_len       = 3
+        cfg.batch_size         = 512
+        cfg.num_negative       = 256
+        cfg.use_history        = True
+        cfg.max_history        = 64
+        cfg.use_direct_scoring = True
+        cfg.use_diachronic     = True
+        cfg.w_direct           = 1.0
+        cfg.w_link             = 1.0
+        cfg.w_self_adv         = 0.5
+        cfg.w_ortho_reg        = 0.01
+        cfg.dropout            = 0.1
+        cfg.label_smoothing    = 0.1
+        cfg.weight_decay       = 1e-4
+        cfg.learning_rate      = 3e-4
+        cfg.num_epochs         = 50
+        logger.info(
+            "ICEWS14: use_history=True, max_history=64, "
+            "DirectScoring=True, Diachronic=True, w_direct=1.0, epochs=50"
+        )
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = EliteTKGModel(
