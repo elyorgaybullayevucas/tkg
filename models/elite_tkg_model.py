@@ -513,7 +513,7 @@ class ORIONModel(nn.Module):
             self.num_times_dia = max(num_times, 1)
 
         # ── Per-relation temperature ───────────────────────────────────────────
-        self.rel_temp = nn.Embedding(num_relations, 1)
+        self.rel_temp = nn.Embedding(num_relations * 2, 1)   # *2 — teskari relatsiyalar ham
         nn.init.constant_(self.rel_temp.weight, 1.0)
 
         self.drop = nn.Dropout(dropout)
