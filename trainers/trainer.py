@@ -65,7 +65,7 @@ class EliteTrainer:
         # Neighborhood + pattern + direct + diachronic — o'rta tezlik
         extra_params: list = []
         for name in ("relation_profile", "hist_transformer", "hist_to_entity",
-                     "gate_mem", "nb_ctx", "hist_norm", "pattern_lib",
+                     "gate_mem", "nb_ctx", "hist_norm", "query_hist_norm", "pattern_lib",
                      "direct_head", "dia_amp", "dia_freq", "dia_phase",
                      # backward compat
                      "msa", "rel_mem", "pna", "csa", "history_encoder", "hist_gate"):
