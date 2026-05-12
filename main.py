@@ -136,16 +136,17 @@ def main():
         cfg.use_reciprocal     = True
         cfg.w_direct           = 2.0
         cfg.w_link             = 1.0
-        cfg.w_self_adv         = 0.5
+        cfg.w_self_adv         = 0.1   # 0.5 → 0.1: Adv loss link lossga raqobat qilmasin
         cfg.w_ortho_reg        = 0.001
         cfg.dropout            = 0.15
         cfg.label_smoothing    = 0.1
         cfg.weight_decay       = 1e-4
-        cfg.learning_rate      = 5e-4
+        cfg.learning_rate      = 3e-4  # 5e-4 → 3e-4: pik LR pastroq, stabil o'qitish
         cfg.num_epochs         = 500
         logger.info(
             f"{cfg.dataset}: use_history=True, max_history=64, reciprocal=True, "
-            f"DirectScoring=True, Diachronic=True, w_direct=2.0, epochs=500, LR=5e-4"
+            f"DirectScoring=True, Diachronic=True, w_direct=2.0, "
+            f"w_self_adv=0.1, LR=3e-4, epochs=500"
         )
 
     elif cfg.dataset == "ICEWS18":
