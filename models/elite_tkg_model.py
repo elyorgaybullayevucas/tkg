@@ -538,18 +538,32 @@ class ORIONModel(nn.Module):
         d_z = self.delta_enc(torch.zeros(s.size(0), dtype=torch.long, device=device))
         return self.query_encoder(torch.cat([s_e, r_e, d_z], dim=-1)), s_e, r_e
 
+    def _fix_rel_idx(self, rel: torch.Tensor) -> torch.Tensor:
+        """
+        utils/paths.py build_graph da inverse relation r+10000 sifatida saqlanadi.
+        Bu yerda uni to'g'ri model embedding indeksiga o'tkazamiz:
+          r + 10000  →  r + num_base_relations  (dataset augmentation bilan bir xil)
+        Masalan YAGO (reciprocal=True): r+10000 → r+20, rel_emb slot 20-29
+        Masalan YAGO (reciprocal=False): r+10000 → r+10, rel_emb slot 10-19
+        """
+        inv_mask = rel >= 10000
+        if inv_mask.any():
+            rel = rel.clone()
+            rel[inv_mask] = (rel[inv_mask] - 10000) + self.num_base_relations
+        return rel.clamp(0, self.rel_emb.num_embeddings - 1)
+
     def _encode_paths(self, paths, path_masks, query_t):
         # paths: (B, P, L, 3);  path_masks: (B, P, L)
         B, P, L, _ = paths.shape
         pf = paths.view(B * P, L, 3)
         mf = path_masks.view(B * P, L)
 
-        rel = pf[:, :, 1]
+        rel = self._fix_rel_idx(pf[:, :, 1])   # r+10000 → to'g'ri indeks
         t_h = pf[:, :, 2]
         t_q = query_t.unsqueeze(1).expand(-1, P).contiguous().view(B * P)
         dt  = (t_q.unsqueeze(1) - t_h.float()).clamp(min=0).long()
 
-        r_e = self.rel_emb(rel.clamp(0, self.rel_emb.num_embeddings - 1))
+        r_e = self.rel_emb(rel)
         d_e = self.delta_enc(dt)
         out = self.path_encoder(r_e, d_e, mf)
         return out.view(B, P, -1)
@@ -565,10 +579,11 @@ class ORIONModel(nn.Module):
         delta_t  = (times.unsqueeze(1) - hist_t.float()).clamp(min=0).long()   # (B, H)
         delta_enc = self.delta_enc(delta_t)                                     # (B, H, D)
 
-        nb_r  = self.rel_emb(hist_rel.clamp(0, self.rel_emb.num_embeddings - 1))  # (B, H, R)
+        hist_rel_fixed = self._fix_rel_idx(hist_rel)                               # r+10000 → to'g'ri indeks
+        nb_r  = self.rel_emb(hist_rel_fixed)                                       # (B, H, R)
 
         # [A] Relation Profile — entity's relation activity signature [NOVEL]
-        profile_enc = self.relation_profile(hist_rel, delta_t, hist_mask)      # (B, H_dim)
+        profile_enc = self.relation_profile(hist_rel_fixed, delta_t, hist_mask)    # (B, H_dim)
 
         # [B] History Transformer — parallel attention over all history [NOVEL]
         hist_out = self.hist_transformer(nb_r, delta_enc, hist_mask)           # (B, H_dim)
@@ -690,7 +705,7 @@ class ORIONModel(nn.Module):
             s_dynamic, hist_signal = self._process_history(
                 times, history, hist_mask, s_emb, r_emb
             )
-            q = self.hist_norm(q + hist_signal)
+            q = self.query_hist_norm(q + hist_signal)   # forward() bilan bir xil norm
 
         path_reprs  = self._encode_paths(paths, path_masks, times)
         q_exp       = q.unsqueeze(1)
